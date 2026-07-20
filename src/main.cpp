@@ -578,6 +578,26 @@ uint64_t estimate_change(const std::vector<std::string>& send_cmd) {
     return 0;
 }
 
+// Copy any user holds from the source snapshot onto the freshly created dest one,
+// so the migrated snapshots keep their destroy protection.
+void copy_holds(const std::string& src_snap, const std::string& dst_snap) {
+    std::string out;
+    try {
+        out = sp::check_output({"zfs", "holds", "-H", src_snap});
+    } catch (const std::exception&) {
+        return;  // holds unsupported / query failed -- not fatal
+    }
+    for (const auto& line : split_lines(out)) {
+        // `zfs holds -H` prints "<snapshot>\t<tag>\t<timestamp>".
+        size_t t1 = line.find('\t');
+        if (t1 == std::string::npos) continue;
+        size_t t2 = line.find('\t', t1 + 1);
+        std::string tag =
+            line.substr(t1 + 1, (t2 == std::string::npos ? line.size() : t2) - t1 - 1);
+        if (!tag.empty()) run_mutate({"zfs", "hold", tag, dst_snap});
+    }
+}
+
 // The send command that reproduces `snapshots[i]` (full for the first, else
 // incremental from the previous snapshot).
 std::vector<std::string> send_command(const std::vector<std::string>& snapshots,
@@ -672,6 +692,7 @@ void replay(const std::string& dest, uint64_t blocksize,
         }
 
         run_mutate({"zfs", "snapshot", dest + "@" + shortname});
+        copy_holds(snap, dest + "@" + shortname);
     }
     progress.finish(done);
 }

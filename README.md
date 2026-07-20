@@ -37,6 +37,10 @@ zvol, efficiently.
 4. Swap names: the original is renamed to `pool/vol-old` (kept as a backup) and
    the new zvol takes the original name.
 
+User **holds** on the source snapshots are copied onto the migrated snapshots, so
+their destroy protection is preserved (note: a held destination snapshot can't be
+`zfs destroy`-ed until the hold is released).
+
 The send stream and its `zstream dump` output are consumed **streaming**, line
 by line — nothing is spilled to disk or held whole in memory, so arbitrarily
 large deltas are fine.
