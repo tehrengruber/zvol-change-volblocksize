@@ -1,0 +1,10 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# IDE
+.idea/
+
+# Test harness scratch (image cache, qemu overlays, guest output)
+/var/tmp/zvol-reblock-*

@@ -1,0 +1,48 @@
+#cloud-config
+# NoCloud seed: install ZFS userland + pytest, mount the repo (ro) and an output
+# dir (rw) over 9p, run the suite, and record the result. Every step is checked;
+# an unexpected failure aborts with a distinct exit code instead of being ignored.
+write_files:
+  - path: /root/run-tests.sh
+    permissions: '0755'
+    content: |
+      #!/bin/bash
+      # cloud-init's runcmd PATH lacks sbin, where zfs/zpool live.
+      export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+      export DEBIAN_FRONTEND=noninteractive
+      export PYTHONDONTWRITEBYTECODE=1
+      exec > /dev/console 2>&1
+      set -x
+
+      # Distinct exit codes so a failure is never mistaken for a test result.
+      fail() { echo "ZVOL_REBLOCK_RESULT:$1"; echo "FATAL: $2"; sync; sleep 3; systemctl poweroff -i; exit "$1"; }
+
+      mkdir -p /mnt/repo /mnt/out
+      mount -t 9p -o trans=virtio,version=9p2000.L out /mnt/out \
+          || fail 91 "output 9p mount failed"
+      mount -t 9p -o trans=virtio,version=9p2000.L,ro repo /mnt/repo \
+          || fail 92 "repo 9p mount failed"
+
+      modprobe zfs || fail 93 "modprobe zfs failed"
+
+      # esm-cache.service holds the apt lock at boot; wait for it via Lock::Timeout.
+      apt-get -o DPkg::Lock::Timeout=600 update || fail 94 "apt-get update failed"
+      if ! command -v zpool >/dev/null; then
+          apt-get -o DPkg::Lock::Timeout=600 install -y zfsutils-linux \
+              || fail 94 "installing zfsutils-linux failed"
+      fi
+      command -v zpool >/dev/null || fail 94 "zpool still missing after install"
+      python3 -c 'import pytest' 2>/dev/null || \
+          apt-get -o DPkg::Lock::Timeout=600 install -y python3-pytest \
+              || fail 94 "installing python3-pytest failed"
+
+      cd /mnt/repo || fail 92 "repo not mounted"
+      python3 -m pytest -v -p no:cacheprovider tests/ 2>&1 | tee /mnt/out/pytest.log
+      RC=${PIPESTATUS[0]}
+      echo "ZVOL_REBLOCK_RESULT:$RC"
+      echo "$RC" > /mnt/out/result
+      sync
+      sleep 3
+      systemctl poweroff -i
+runcmd:
+  - [ bash, /root/run-tests.sh ]
