@@ -56,9 +56,6 @@ constexpr uint64_t FREEOBJECTS_FIRST = ZVOL_ZAP_OBJ + 1;                        
 
 constexpr size_t CHUNK = 4 * 1024 * 1024;
 
-const std::set<std::string> KNOWN_RECORDS = {
-    "BEGIN", "END", "OBJECT", "OBJECT_RANGE", "FREEOBJECTS", "FREE",
-    "WRITE", "WRITE_BYREF", "WRITE_EMBEDDED", "SPILL", "REDACT"};
 const std::set<std::string> IGNORED_RECORDS = {"BEGIN", "END", "OBJECT"};
 const std::set<std::string> SUMMARY_TOKENS = {"SUMMARY:", "SUMMARY", "Total",
                                               "Estimated"};
@@ -221,42 +218,19 @@ Change classify(const std::string& rtype,
 void for_each_change(const std::vector<std::string>& send_cmd,
                      const std::vector<std::string>& zstream_cmd,
                      const std::function<void(const Change&)>& cb) {
-    std::string cur_type;
-    std::map<std::string, std::string> cur;
-    bool have = false, ended = false;
-
-    auto flush = [&] {
-        if (have) {
-            Change c = classify(cur_type, cur);
-            if (c.op != Op::None) cb(c);
-        }
-    };
-
+    // Every record we act on (WRITE/FREE/FREEOBJECTS) is printed on a single line
+    // as `KEYWORD field = value ...`.  We tell a record header from a field
+    // continuation line (e.g. BEGIN's, printed as `field = value`) by grammar --
+    // a continuation line's second token is '=' -- so parsing does not depend on
+    // indentation.  classify() ignores/handles/rejects each keyword.
     sp::pipeline_for_each_line(send_cmd, zstream_cmd, [&](const std::string& line) {
-        if (ended || trim(line).empty()) return;
-        bool header = !std::isspace(static_cast<unsigned char>(line[0]));
         std::vector<std::string> toks = split_ws(line);
-        if (header) {
-            const std::string& rt = toks[0];
-            if (!KNOWN_RECORDS.count(rt)) {
-                if (SUMMARY_TOKENS.count(rt)) {
-                    ended = true;
-                    return;
-                }
-                throw MigrateError("unexpected send output line: " + trim(line));
-            }
-            flush();
-            cur_type = rt;
-            // The record keyword at toks[0] never sits adjacent to '=', so
-            // scanning the whole line is equivalent to skipping it.
-            cur = kv_pairs(toks);
-            have = true;
-            if (rt == "END") ended = true;
-        } else {
-            for (auto& [k, v] : kv_pairs(toks)) cur[k] = v;
-        }
+        if (toks.empty()) return;
+        if (toks.size() > 1 && toks[1] == "=") return;  // field continuation line
+        if (SUMMARY_TOKENS.count(toks[0])) return;       // trailing summary block
+        Change c = classify(toks[0], kv_pairs(toks));
+        if (c.op != Op::None) cb(c);
     });
-    if (!ended) flush();
 }
 
 // ---- applying changed ranges to the destination device ------------------- //
