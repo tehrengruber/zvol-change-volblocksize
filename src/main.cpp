@@ -310,6 +310,11 @@ class Progress {
         uint64_t blocks = std::max<uint64_t>(1, (10ull * 1024 * 1024) / blocksize);
         redraw_bytes_ = blocks * blocksize;  // ~10 MB, rounded to a block boundary
     }
+    ~Progress() {
+        // If we're being torn down without finish() (e.g. an exception aborted the
+        // work), wipe the half-drawn bar line so the error prints on a clean line.
+        if (tty_ && drawn_ && !finished_) std::cerr << "\r\033[K" << std::flush;
+    }
 
     void update(uint64_t done) {
         if (!tty_) return;
@@ -345,6 +350,7 @@ class Progress {
         std::cerr << l.str() << std::flush;
     }
     void finish(uint64_t done) {
+        finished_ = true;
         if (!tty_) return;
         double secs = std::chrono::duration<double>(
                           std::chrono::steady_clock::now() - start_).count();
@@ -371,6 +377,7 @@ class Progress {
     uint64_t redraw_bytes_ = 0;
     uint64_t last_drawn_ = 0;
     bool drawn_ = false;
+    bool finished_ = false;
     // (timestamp, cumulative bytes) samples within the trailing ~10s window.
     std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> window_;
 };
@@ -680,7 +687,8 @@ uint64_t volsize_of(const std::string& dataset) {
 // from a content difference (the latter returns false).
 bool devices_identical(const std::string& dev_a, const std::string& dev_b,
                        uint64_t size,
-                       const std::function<void(uint64_t)>& on_progress = {}) {
+                       const std::function<void(uint64_t)>& on_progress = {},
+                       uint64_t* first_diff = nullptr) {
     int fa = open(dev_a.c_str(), O_RDONLY);
     int fb = open(dev_b.c_str(), O_RDONLY);
     if (fa < 0 || fb < 0) {
@@ -698,7 +706,15 @@ bool devices_identical(const std::string& dev_a, const std::string& dev_b,
                 !sp::pread_full(fb, bb.data(), n, pos))
                 throw MigrateError("read error while verifying at offset " +
                                    std::to_string(pos));
-            if (std::memcmp(ba.data(), bb.data(), n) != 0) equal = false;
+            if (std::memcmp(ba.data(), bb.data(), n) != 0) {
+                equal = false;
+                if (first_diff)  // pin down the exact byte for the message
+                    for (size_t k = 0; k < n; ++k)
+                        if (ba[k] != bb[k]) {
+                            *first_diff = pos + k;
+                            break;
+                        }
+            }
             pos += n;
             if (on_progress) on_progress(pos);
         }
@@ -771,10 +787,12 @@ void verify(const std::string& new_ds, const std::string& orig_ds,
         uint64_t common = std::min(it.sa, it.sb);
         std::string da = wait_for_device("/dev/zvol/" + it.a);
         std::string db = wait_for_device("/dev/zvol/" + it.b);
+        uint64_t at = 0;
         if (!devices_identical(da, db, common,
-                               [&](uint64_t n) { progress.update(done + n); }))
+                               [&](uint64_t n) { progress.update(done + n); }, &at))
             throw MigrateError("verification FAILED: " + it.what +
-                               " is not byte-identical to the original");
+                               " differs from the original at offset " +
+                               std::to_string(at) + " (" + human(at) + ")");
         // If the destination was rounded up to the new blocksize, the extra tail
         // must read as zeros (what the README promises for that region).
         if (it.sa != it.sb) {
