@@ -21,6 +21,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -233,6 +234,50 @@ void for_each_change(const std::vector<std::string>& send_cmd,
     });
 }
 
+// ---- progress reporting -------------------------------------------------- //
+
+std::string human(uint64_t bytes) {
+    const char* units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+    double v = static_cast<double>(bytes);
+    int u = 0;
+    while (v >= 1024.0 && u < 4) {
+        v /= 1024.0;
+        ++u;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof buf, u == 0 ? "%.0f %s" : "%.1f %s", v, units[u]);
+    return buf;
+}
+
+// A one-line progress display on stderr, drawn only when stderr is a terminal so
+// scripts and logs stay clean.  `total` is an estimate (0 = unknown).
+class Progress {
+   public:
+    Progress(std::string label, uint64_t total)
+        : label_(std::move(label)), total_(total), tty_(isatty(STDERR_FILENO)) {}
+
+    void update(uint64_t done) {
+        if (!tty_) return;
+        if (total_ == 0)
+            std::cerr << '\r' << label_ << ' ' << human(done) << "    " << std::flush;
+        else
+            std::cerr << '\r' << label_ << ' '
+                      << std::min<uint64_t>(100, done * 100 / total_) << "% ("
+                      << human(done) << " / ~" << human(total_) << ")    "
+                      << std::flush;
+    }
+    void finish(uint64_t done) {
+        if (tty_)
+            std::cerr << '\r' << label_ << " done (" << human(done) << ")        \n"
+                      << std::flush;
+    }
+
+   private:
+    std::string label_;
+    uint64_t total_;
+    bool tty_;
+};
+
 // ---- applying changed ranges to the destination device ------------------- //
 
 class RangeApplier {
@@ -271,6 +316,7 @@ class RangeApplier {
                 throw MigrateError("short write to destination");
             bytes_written_ += static_cast<uint64_t>(got);
             pos += static_cast<uint64_t>(got);
+            if (on_progress_) on_progress_(bytes_written_);
         }
     }
 
@@ -295,6 +341,9 @@ class RangeApplier {
 
     uint64_t bytes_written() const { return bytes_written_; }
     uint64_t bytes_freed() const { return bytes_freed_; }
+    void set_progress(std::function<void(uint64_t)> cb) {
+        on_progress_ = std::move(cb);
+    }
 
    private:
     void discard(uint64_t offset, uint64_t length) {
@@ -321,6 +370,7 @@ class RangeApplier {
     uint64_t pend_start_ = 0, pend_end_ = 0;
     uint64_t bytes_written_ = 0, bytes_freed_ = 0;
     std::vector<char> buf_ = std::vector<char>(CHUNK);
+    std::function<void(uint64_t)> on_progress_;
 };
 
 // ---- migration ----------------------------------------------------------- //
@@ -380,18 +430,40 @@ void create_dest(const std::string& dest, uint64_t blocksize, uint64_t volsize) 
     run_mutate(cmd);
 }
 
+// Cheap up-front estimate of the change size via a dry-run send (no data is
+// streamed).  `zfs send -nP` prints a "size <bytes>" line; being derived from the
+// plain (decompressed) stream it tracks the logical bytes we copy to within a
+// couple of percent, regardless of on-disk compression.  Returns 0 if unknown.
+uint64_t estimate_change(const std::vector<std::string>& send_cmd) {
+    std::vector<std::string> cmd = {send_cmd[0], send_cmd[1], "-nP"};
+    cmd.insert(cmd.end(), send_cmd.begin() + 2, send_cmd.end());
+    try {
+        for (const auto& line : split_lines(sp::check_output(cmd))) {
+            std::vector<std::string> t = split_ws(line);
+            if (t.size() >= 2 && t[0] == "size") return std::stoull(t[1]);
+        }
+    } catch (const std::exception&) {
+    }
+    return 0;
+}
+
 void replay(const std::string& dest, uint64_t blocksize,
             const std::vector<std::string>& snapshots,
             const std::vector<std::string>& zstream_cmd) {
     std::string dst_dev = "/dev/zvol/" + dest;
     std::string prev;
-    for (const auto& snap : snapshots) {
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+        const std::string& snap = snapshots[i];
         std::string shortname = snap.substr(snap.find('@') + 1);
         uint64_t snap_volsize = std::stoull(zfs_get(snap, "volsize"));
         uint64_t dst_volsize = align_up(snap_volsize, blocksize);
         log("snapshot " + shortname + ": volsize=" + std::to_string(snap_volsize) +
             " (dest " + std::to_string(dst_volsize) + ")");
         run_mutate({"zfs", "set", "volsize=" + std::to_string(dst_volsize), dest});
+
+        std::vector<std::string> send_cmd =
+            prev.empty() ? std::vector<std::string>{"zfs", "send", snap}
+                         : std::vector<std::string>{"zfs", "send", "-i", prev, snap};
 
         if (g_opts.dry_run) {
             std::cerr << "DRY-RUN: replay "
@@ -402,17 +474,22 @@ void replay(const std::string& dest, uint64_t blocksize,
             continue;
         }
 
+        uint64_t estimate = estimate_change(send_cmd);  // dry-run, 0 = unknown
+        std::string label = "[" + std::to_string(i + 1) + "/" +
+                            std::to_string(snapshots.size()) + "] " + shortname;
+        log("+ " + sp::join(send_cmd) + " | " + sp::join(zstream_cmd) + "  (~" +
+            std::to_string(estimate) + " bytes)");
+
         std::string src_dev = wait_for_device("/dev/zvol/" + snap);
         wait_for_device(dst_dev);
         int dst_fd = open(dst_dev.c_str(), O_RDWR);
         if (dst_fd < 0) throw MigrateError("cannot open destination " + dst_dev);
 
+        uint64_t wrote = 0, freed = 0;
         {
+            Progress progress(label, estimate);
             RangeApplier applier(src_dev, dst_fd, blocksize, dst_volsize);
-            std::vector<std::string> send_cmd =
-                prev.empty() ? std::vector<std::string>{"zfs", "send", snap}
-                             : std::vector<std::string>{"zfs", "send", "-i", prev, snap};
-            log("+ " + sp::join(send_cmd) + " | " + sp::join(zstream_cmd));
+            applier.set_progress([&](uint64_t w) { progress.update(w); });
             for_each_change(send_cmd, zstream_cmd, [&](const Change& c) {
                 if (c.op == Op::Write)
                     applier.write(c.offset, static_cast<uint64_t>(c.length));
@@ -421,10 +498,27 @@ void replay(const std::string& dest, uint64_t blocksize,
             });
             applier.flush();
             fsync(dst_fd);
-            log("  wrote " + std::to_string(applier.bytes_written()) +
-                " bytes, freed " + std::to_string(applier.bytes_freed()) + " bytes");
+            wrote = applier.bytes_written();
+            freed = applier.bytes_freed();
+            progress.finish(wrote);
         }
         close(dst_fd);
+        log("  wrote " + std::to_string(wrote) + " bytes, freed " +
+            std::to_string(freed) + " bytes (estimate " + std::to_string(estimate) +
+            ")");
+
+        // Sanity-check against the estimate: the dry-run size is not exact (stream
+        // overhead), so allow up to 5% drift; the small absolute floor keeps tiny
+        // or free-only increments (where fixed overhead dominates) from tripping it.
+        if (estimate > 0) {
+            uint64_t diff = wrote > estimate ? wrote - estimate : estimate - wrote;
+            if (diff > 128 * 1024 && diff * 20 > estimate)
+                throw MigrateError(
+                    "size drift for " + shortname + ": ZFS estimated ~" +
+                    human(estimate) + " of changes but " + human(wrote) +
+                    " were written (>5%)");
+        }
+
         run_mutate({"zfs", "snapshot", dest + "@" + shortname});
         prev = snap;
     }
