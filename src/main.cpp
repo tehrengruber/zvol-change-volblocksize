@@ -26,6 +26,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -295,9 +296,10 @@ std::string human_time(double seconds) {
 }
 
 // A one-line progress display on stderr showing percentage, bytes, transfer speed
-// and ETA.  Drawn only when stderr is a terminal (so scripts/logs stay clean) and
-// redrawn at most once per ~10 MB of progress, expressed as a whole number of
-// destination blocks.  `total` is an estimate (0 = unknown -> no % / ETA).
+// (over the last ~10 seconds) and ETA.  Drawn only when stderr is a terminal (so
+// scripts/logs stay clean) and redrawn at most once per ~10 MB of progress,
+// expressed as a whole number of destination blocks.  `total` is an estimate
+// (0 = unknown -> no % / ETA).
 class Progress {
    public:
     Progress(std::string label, uint64_t total, uint64_t blocksize)
@@ -311,12 +313,24 @@ class Progress {
 
     void update(uint64_t done) {
         if (!tty_) return;
+        auto now = std::chrono::steady_clock::now();
+        // Keep a sliding window of samples so the displayed speed reflects the last
+        // ~10 seconds rather than the whole-run average.
+        window_.emplace_back(now, done);
+        while (window_.size() > 1 &&
+               now - window_.front().first > std::chrono::seconds(10))
+            window_.pop_front();
+
         if (drawn_ && done < total_ && done - last_drawn_ < redraw_bytes_) return;
         drawn_ = true;
         last_drawn_ = done;
-        auto now = std::chrono::steady_clock::now();
-        double secs = std::chrono::duration<double>(now - start_).count();
-        uint64_t rate = secs > 0 ? static_cast<uint64_t>(done / secs) : 0;
+
+        double wsecs =
+            std::chrono::duration<double>(now - window_.front().first).count();
+        uint64_t rate =
+            wsecs > 0
+                ? static_cast<uint64_t>((done - window_.front().second) / wsecs)
+                : 0;
         std::ostringstream l;
         l << '\r' << label_ << ' ';
         if (total_)
@@ -349,6 +363,8 @@ class Progress {
     uint64_t redraw_bytes_ = 0;
     uint64_t last_drawn_ = 0;
     bool drawn_ = false;
+    // (timestamp, cumulative bytes) samples within the trailing ~10s window.
+    std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> window_;
 };
 
 // ---- applying changed ranges to the destination device ------------------- //
@@ -467,6 +483,7 @@ struct Options {
     std::string volblocksize;
     std::string dest;
     std::string backup_suffix = "-old";
+    std::string resume_from;  // resume replay from this source snapshot
     bool no_swap = false;
     bool keep_backup = true;
     bool force = false;
@@ -556,34 +573,31 @@ std::vector<std::string> send_command(const std::vector<std::string>& snapshots,
 
 void replay(const std::string& dest, uint64_t blocksize,
             const std::vector<std::string>& snapshots,
-            const std::vector<std::string>& zstream_cmd) {
+            const std::vector<std::string>& zstream_cmd, size_t start) {
     std::string dst_dev = "/dev/zvol/" + dest;
 
     if (g_opts.dry_run) {
-        std::string prev;
-        for (const auto& snap : snapshots) {
+        for (size_t i = start; i < snapshots.size(); ++i)
             std::cerr << "DRY-RUN: replay "
-                      << (prev.empty() ? "full" : "incremental from " + prev)
-                      << " -> " << snap << std::endl;
-            prev = snap;
-        }
+                      << (i == 0 ? "full" : "incremental from " + snapshots[i - 1])
+                      << " -> " << snapshots[i] << std::endl;
         return;
     }
 
-    // Estimate every snapshot's change size up front (cheap dry-run sends) so the
-    // progress bar can show one total across the whole migration, and each step
+    // Estimate each replayed snapshot's change size up front (cheap dry-run sends)
+    // so the progress bar can show one total across the whole run, and each step
     // still has its own figure for the drift check.
     std::vector<uint64_t> estimates(snapshots.size());
     uint64_t total = 0;
-    for (size_t i = 0; i < snapshots.size(); ++i) {
+    for (size_t i = start; i < snapshots.size(); ++i) {
         estimates[i] = estimate_change(send_command(snapshots, i));
         total += estimates[i];
     }
-    Progress progress(std::to_string(snapshots.size()) + " snapshots", total,
+    Progress progress(std::to_string(snapshots.size() - start) + " snapshots", total,
                       blocksize);
-    uint64_t done = 0;  // bytes written so far across all snapshots
+    uint64_t done = 0;  // bytes written so far across all replayed snapshots
 
-    for (size_t i = 0; i < snapshots.size(); ++i) {
+    for (size_t i = start; i < snapshots.size(); ++i) {
         const std::string& snap = snapshots[i];
         std::string shortname = snap.substr(snap.find('@') + 1);
         uint64_t snap_volsize = to_u64(zfs_get(snap, "volsize"), "snapshot volsize");
@@ -625,15 +639,15 @@ void replay(const std::string& dest, uint64_t blocksize,
             ")");
 
         // Sanity-check against the estimate: the dry-run size is not exact (stream
-        // overhead), so allow up to 5% drift; the small absolute floor keeps tiny
-        // or free-only increments (where fixed overhead dominates) from tripping it.
+        // overhead), so this is only a warning, and only past 10% (the small
+        // absolute floor keeps tiny/free-only increments from tripping it).
         if (estimate > 0) {
             uint64_t diff = wrote > estimate ? wrote - estimate : estimate - wrote;
-            if (diff > 128 * 1024 && diff * 20 > estimate)
-                throw MigrateError(
-                    "size drift for " + shortname + ": ZFS estimated ~" +
-                    human(estimate) + " of changes but " + human(wrote) +
-                    " were written (>5%)");
+            if (diff > 128 * 1024 && diff * 10 > estimate)
+                std::cerr << "warning: size drift for " << shortname
+                          << ": ZFS estimated ~" << human(estimate)
+                          << " of changes but " << human(wrote)
+                          << " were written (>10%)\n";
         }
 
         run_mutate({"zfs", "snapshot", dest + "@" + shortname});
@@ -843,14 +857,58 @@ void migrate() {
     std::string dest = g_opts.dest.empty() ? g_opts.source + "-new" : g_opts.dest;
     std::string backup = g_opts.source + g_opts.backup_suffix;
 
-    // Pre-flight name checks: fail now, not after hours of copying.
     auto exists = [](const std::string& ds) {
         return sp::run_quiet({"zfs", "list", ds}) == 0;
     };
-    if (exists(dest))
+    auto short_of = [](const std::string& s) {
+        return s.substr(s.find('@') + 1);
+    };
+
+    // --resume-from: continue an interrupted run.  `start` is the index of the
+    // first snapshot to replay; everything before it must already be on the target.
+    size_t start = 0;
+    bool resuming = !g_opts.resume_from.empty();
+    if (resuming) {
+        size_t r = snapshots.size();
+        for (size_t i = 0; i < snapshots.size(); ++i)
+            if (snapshots[i] == g_opts.resume_from ||
+                short_of(snapshots[i]) == g_opts.resume_from) {
+                r = i;
+                break;
+            }
+        if (r == snapshots.size())
+            throw MigrateError("--resume-from " + g_opts.resume_from +
+                               " is not a snapshot of " + g_opts.source);
+        start = r;
+
+        if (!exists(dest))
+            throw MigrateError(
+                "--resume-from needs the destination " + dest +
+                " from the interrupted run, but it does not exist");
+        // The only check: the earlier snapshots already exist on the target.
+        for (size_t i = 0; i < r; ++i)
+            if (!exists(dest + "@" + short_of(snapshots[i])))
+                throw MigrateError("--resume-from " + g_opts.resume_from +
+                                   ": expected " + dest + "@" + short_of(snapshots[i]) +
+                                   " on the target but it is missing");
+
+        // Show the size of the snapshot just before the resume point, so the base
+        // the incremental builds on can be eyeballed on both sides.
+        if (r >= 1) {
+            std::string p = short_of(snapshots[r - 1]);
+            std::cout << "resuming at @" << short_of(snapshots[r]) << " (from @" << p
+                      << "): source referenced "
+                      << human(to_u64(zfs_get(snapshots[r - 1], "referenced"), "ref"))
+                      << ", target referenced "
+                      << human(to_u64(zfs_get(dest + "@" + p, "referenced"), "ref"))
+                      << std::endl;
+        }
+    } else if (exists(dest)) {  // pre-flight name check (skip when resuming)
         throw MigrateError(
-            dest + " already exists (leftover from a previous run? destroy it with "
-            "`zfs destroy -r " + dest + "`, or choose another --dest)");
+            dest + " already exists (leftover from a previous run? resume with "
+            "`--resume-from <snapshot>`, destroy it with `zfs destroy -r " + dest +
+            "`, or choose another --dest)");
+    }
     if (!g_opts.no_swap && exists(backup))
         throw MigrateError(backup +
                            " already exists; destroy it or choose another "
@@ -893,11 +951,13 @@ void migrate() {
 
     bool dest_created = false;
     try {
-        uint64_t first_volsize = align_up(
-            to_u64(zfs_get(snapshots.front(), "volsize"), "volsize"), blocksize);
-        create_dest(dest, blocksize, first_volsize);
-        dest_created = true;
-        replay(dest, blocksize, snapshots, zstream_cmd);
+        if (!resuming) {
+            uint64_t first_volsize = align_up(
+                to_u64(zfs_get(snapshots.front(), "volsize"), "volsize"), blocksize);
+            create_dest(dest, blocksize, first_volsize);
+            dest_created = true;
+        }
+        replay(dest, blocksize, snapshots, zstream_cmd, start);
 
         // Re-derive reservations the sparse create (-s) dropped, after the final
         // volsize and before verify/swap -- so the thick guarantee is never missing
@@ -945,6 +1005,9 @@ const char* USAGE =
     "  --dest NAME           intermediate name (default: <source>-new)\n"
     "  --backup-suffix S     suffix for the preserved original (default: -old)\n"
     "  --no-swap             leave the result under --dest; do not rename\n"
+    "  --resume-from SNAP    continue an interrupted run: replay from source\n"
+    "                        snapshot SNAP onward onto an existing --dest (whose\n"
+    "                        earlier snapshots must already be present)\n"
     "  --keep-backup         keep the original as backup (default)\n"
     "  --destroy-backup      destroy the original after a successful swap\n"
     "  --force               bypass precondition checks (readonly=on, and that the\n"
@@ -972,6 +1035,8 @@ bool parse_args(int argc, char** argv) {
             g_opts.dest = next();
         } else if (a == "--backup-suffix") {
             g_opts.backup_suffix = next();
+        } else if (a == "--resume-from") {
+            g_opts.resume_from = next();
         } else if (a == "--no-swap") {
             g_opts.no_swap = true;
         } else if (a == "--keep-backup") {
