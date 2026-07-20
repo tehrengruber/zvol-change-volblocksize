@@ -286,33 +286,69 @@ std::string human(uint64_t bytes) {
     return buf;
 }
 
-// A one-line progress display on stderr, drawn only when stderr is a terminal so
-// scripts and logs stay clean.  `total` is an estimate (0 = unknown).
+std::string human_time(double seconds) {
+    long t = static_cast<long>(seconds + 0.5);
+    if (t < 60) return std::to_string(t) + "s";
+    if (t < 3600)
+        return std::to_string(t / 60) + "m" + std::to_string(t % 60) + "s";
+    return std::to_string(t / 3600) + "h" + std::to_string((t % 3600) / 60) + "m";
+}
+
+// A one-line progress display on stderr showing percentage, bytes, transfer speed
+// and ETA.  Drawn only when stderr is a terminal (so scripts/logs stay clean) and
+// redrawn at most once per ~10 MB of progress, expressed as a whole number of
+// destination blocks.  `total` is an estimate (0 = unknown -> no % / ETA).
 class Progress {
    public:
-    Progress(std::string label, uint64_t total)
-        : label_(std::move(label)), total_(total), tty_(isatty(STDERR_FILENO)) {}
+    Progress(std::string label, uint64_t total, uint64_t blocksize)
+        : label_(std::move(label)),
+          total_(total),
+          tty_(isatty(STDERR_FILENO)),
+          start_(std::chrono::steady_clock::now()) {
+        uint64_t blocks = std::max<uint64_t>(1, (10ull * 1024 * 1024) / blocksize);
+        redraw_bytes_ = blocks * blocksize;  // ~10 MB, rounded to a block boundary
+    }
 
     void update(uint64_t done) {
         if (!tty_) return;
-        if (total_ == 0)
-            std::cerr << '\r' << label_ << ' ' << human(done) << "    " << std::flush;
+        if (drawn_ && done < total_ && done - last_drawn_ < redraw_bytes_) return;
+        drawn_ = true;
+        last_drawn_ = done;
+        auto now = std::chrono::steady_clock::now();
+        double secs = std::chrono::duration<double>(now - start_).count();
+        uint64_t rate = secs > 0 ? static_cast<uint64_t>(done / secs) : 0;
+        std::ostringstream l;
+        l << '\r' << label_ << ' ';
+        if (total_)
+            l << std::min<uint64_t>(100, done * 100 / total_) << "% (" << human(done)
+              << " / ~" << human(total_) << ')';
         else
-            std::cerr << '\r' << label_ << ' '
-                      << std::min<uint64_t>(100, done * 100 / total_) << "% ("
-                      << human(done) << " / ~" << human(total_) << ")    "
-                      << std::flush;
+            l << human(done);
+        l << " at " << human(rate) << "/s";
+        if (total_ && rate > 0 && done < total_)
+            l << ", ETA " << human_time(static_cast<double>(total_ - done) / rate);
+        l << "        ";
+        std::cerr << l.str() << std::flush;
     }
     void finish(uint64_t done) {
-        if (tty_)
-            std::cerr << '\r' << label_ << " done (" << human(done) << ")        \n"
-                      << std::flush;
+        if (!tty_) return;
+        double secs = std::chrono::duration<double>(
+                          std::chrono::steady_clock::now() - start_).count();
+        uint64_t rate = secs > 0 ? static_cast<uint64_t>(done / secs) : 0;
+        std::cerr << '\r' << label_ << ": copied " << human(done) << " in "
+                  << human_time(secs) << " (" << human(rate) << "/s)          \n"
+                  << std::flush;
     }
 
    private:
+
     std::string label_;
     uint64_t total_;
     bool tty_;
+    std::chrono::steady_clock::time_point start_;
+    uint64_t redraw_bytes_ = 0;
+    uint64_t last_drawn_ = 0;
+    bool drawn_ = false;
 };
 
 // ---- applying changed ranges to the destination device ------------------- //
@@ -509,11 +545,44 @@ uint64_t estimate_change(const std::vector<std::string>& send_cmd) {
     return 0;
 }
 
+// The send command that reproduces `snapshots[i]` (full for the first, else
+// incremental from the previous snapshot).
+std::vector<std::string> send_command(const std::vector<std::string>& snapshots,
+                                      size_t i) {
+    return i == 0 ? std::vector<std::string>{"zfs", "send", snapshots[i]}
+                  : std::vector<std::string>{"zfs", "send", "-i", snapshots[i - 1],
+                                             snapshots[i]};
+}
+
 void replay(const std::string& dest, uint64_t blocksize,
             const std::vector<std::string>& snapshots,
             const std::vector<std::string>& zstream_cmd) {
     std::string dst_dev = "/dev/zvol/" + dest;
-    std::string prev;
+
+    if (g_opts.dry_run) {
+        std::string prev;
+        for (const auto& snap : snapshots) {
+            std::cerr << "DRY-RUN: replay "
+                      << (prev.empty() ? "full" : "incremental from " + prev)
+                      << " -> " << snap << std::endl;
+            prev = snap;
+        }
+        return;
+    }
+
+    // Estimate every snapshot's change size up front (cheap dry-run sends) so the
+    // progress bar can show one total across the whole migration, and each step
+    // still has its own figure for the drift check.
+    std::vector<uint64_t> estimates(snapshots.size());
+    uint64_t total = 0;
+    for (size_t i = 0; i < snapshots.size(); ++i) {
+        estimates[i] = estimate_change(send_command(snapshots, i));
+        total += estimates[i];
+    }
+    Progress progress(std::to_string(snapshots.size()) + " snapshots", total,
+                      blocksize);
+    uint64_t done = 0;  // bytes written so far across all snapshots
+
     for (size_t i = 0; i < snapshots.size(); ++i) {
         const std::string& snap = snapshots[i];
         std::string shortname = snap.substr(snap.find('@') + 1);
@@ -523,22 +592,8 @@ void replay(const std::string& dest, uint64_t blocksize,
             " (dest " + std::to_string(dst_volsize) + ")");
         run_mutate({"zfs", "set", "volsize=" + std::to_string(dst_volsize), dest});
 
-        std::vector<std::string> send_cmd =
-            prev.empty() ? std::vector<std::string>{"zfs", "send", snap}
-                         : std::vector<std::string>{"zfs", "send", "-i", prev, snap};
-
-        if (g_opts.dry_run) {
-            std::cerr << "DRY-RUN: replay "
-                      << (prev.empty() ? "full" : "incremental from " + prev)
-                      << " -> " << snap << ", snapshot " << dest << "@" << shortname
-                      << std::endl;
-            prev = snap;
-            continue;
-        }
-
-        uint64_t estimate = estimate_change(send_cmd);  // dry-run, 0 = unknown
-        std::string label = "[" + std::to_string(i + 1) + "/" +
-                            std::to_string(snapshots.size()) + "] " + shortname;
+        std::vector<std::string> send_cmd = send_command(snapshots, i);
+        uint64_t estimate = estimates[i];
         log("+ " + sp::join(send_cmd) + " | " + sp::join(zstream_cmd) + "  (~" +
             std::to_string(estimate) + " bytes)");
 
@@ -549,9 +604,8 @@ void replay(const std::string& dest, uint64_t blocksize,
 
         uint64_t wrote = 0, freed = 0;
         {
-            Progress progress(label, estimate);
             RangeApplier applier(src_dev, dst_fd, blocksize, dst_volsize);
-            applier.set_progress([&](uint64_t w) { progress.update(w); });
+            applier.set_progress([&](uint64_t w) { progress.update(done + w); });
             for_each_change(send_cmd, zstream_cmd, [&](const Change& c) {
                 throw_if_interrupted();
                 if (c.op == Op::Write)
@@ -563,9 +617,9 @@ void replay(const std::string& dest, uint64_t blocksize,
             fsync(dst_fd);
             wrote = applier.bytes_written();
             freed = applier.bytes_freed();
-            progress.finish(wrote);
         }
         close(dst_fd);
+        done += wrote;
         log("  wrote " + std::to_string(wrote) + " bytes, freed " +
             std::to_string(freed) + " bytes (estimate " + std::to_string(estimate) +
             ")");
@@ -583,8 +637,8 @@ void replay(const std::string& dest, uint64_t blocksize,
         }
 
         run_mutate({"zfs", "snapshot", dest + "@" + shortname});
-        prev = snap;
     }
+    progress.finish(done);
 }
 
 // ---- verification -------------------------------------------------------- //
