@@ -1,0 +1,156 @@
+// C++ has no standard process/pipe facility, so this is POSIX fork/exec.  We keep
+// argv-based spawning (no shell) to avoid quoting/injection of arbitrary property
+// values and to observe each process's exit code precisely.  O_CLOEXEC pipe ends
+// mean the children need no manual fd bookkeeping: they close automatically on
+// exec, leaving only what we dup'd onto stdin/stdout.
+#define _GNU_SOURCE 1
+
+#include "subprocess.hpp"
+
+#include <fcntl.h>
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <exception>
+
+namespace sp {
+
+std::string join(const std::vector<std::string>& args) {
+    std::string s;
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) s += ' ';
+        s += args[i];
+    }
+    return s;
+}
+
+[[noreturn]] static void exec_or_die(const std::vector<std::string>& args) {
+    std::vector<char*> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto& a : args) argv.push_back(const_cast<char*>(a.c_str()));
+    argv.push_back(nullptr);
+    execvp(argv[0], argv.data());
+    _exit(127);  // exec failed (e.g. command not found)
+}
+
+static int exit_code(int status) {
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+// Fork and exec `args`, redirecting stdin/stdout/stderr to the given fds when
+// >= 0.  Those fds should be O_CLOEXEC (e.g. pipe2 ends); dup2 clears CLOEXEC on
+// the descriptor it installs, so exactly the redirected streams survive exec.
+static pid_t spawn(const std::vector<std::string>& args, int in_fd = -1,
+                   int out_fd = -1, int err_fd = -1) {
+    pid_t pid = fork();
+    if (pid < 0) throw CommandError("fork() failed");
+    if (pid == 0) {
+        if (in_fd >= 0) dup2(in_fd, STDIN_FILENO);
+        if (out_fd >= 0) dup2(out_fd, STDOUT_FILENO);
+        if (err_fd >= 0) dup2(err_fd, STDERR_FILENO);
+        exec_or_die(args);
+    }
+    return pid;
+}
+
+std::string check_output(const std::vector<std::string>& args) {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) throw CommandError("pipe2() failed");
+    pid_t pid = spawn(args, -1, fds[1]);
+    close(fds[1]);
+    std::string out;
+    char buf[65536];
+    ssize_t n;
+    while ((n = read(fds[0], buf, sizeof buf)) > 0) out.append(buf, n);
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (exit_code(status) != 0)
+        throw CommandError("command failed: " + join(args));
+    return out;
+}
+
+int call_status(const std::vector<std::string>& args) {
+    pid_t pid = spawn(args);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return exit_code(status);
+}
+
+void check_call(const std::vector<std::string>& args) {
+    int rc = call_status(args);
+    if (rc != 0)
+        throw CommandError("command failed (rc=" + std::to_string(rc) + "): " +
+                           join(args));
+}
+
+int run_quiet(const std::vector<std::string>& args) {
+    int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    pid_t pid = spawn(args, -1, devnull, devnull);
+    if (devnull >= 0) close(devnull);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    return exit_code(status);
+}
+
+void pipeline_for_each_line(
+    const std::vector<std::string>& producer,
+    const std::vector<std::string>& consumer,
+    const std::function<void(const std::string&)>& on_line) {
+    int p1[2], p2[2];  // producer->consumer, consumer->parent
+    if (pipe2(p1, O_CLOEXEC) != 0 || pipe2(p2, O_CLOEXEC) != 0)
+        throw CommandError("pipe2() failed");
+
+    pid_t prod = spawn(producer, -1, p1[1]);
+    pid_t cons = spawn(consumer, p1[0], p2[1]);
+    close(p1[0]);
+    close(p1[1]);
+    close(p2[1]);
+
+    FILE* f = fdopen(p2[0], "r");
+    if (!f) {
+        close(p2[0]);
+        kill(prod, SIGKILL);
+        kill(cons, SIGKILL);
+        waitpid(prod, nullptr, 0);
+        waitpid(cons, nullptr, 0);
+        throw CommandError("fdopen() failed");
+    }
+
+    std::exception_ptr err;
+    char* line = nullptr;
+    size_t cap = 0;
+    ssize_t len;
+    try {
+        while ((len = getline(&line, &cap, f)) >= 0)
+            on_line(std::string(line, static_cast<size_t>(len)));
+    } catch (...) {
+        err = std::current_exception();
+    }
+    free(line);
+    fclose(f);
+
+    if (err) {  // consumer stopped early: unblock the children before reaping
+        kill(prod, SIGKILL);
+        kill(cons, SIGKILL);
+    }
+    int st_prod = 0, st_cons = 0;
+    waitpid(prod, &st_prod, 0);
+    waitpid(cons, &st_cons, 0);
+    if (err) std::rethrow_exception(err);
+
+    if (exit_code(st_cons) != 0)
+        throw CommandError("consumer failed (rc=" +
+                           std::to_string(exit_code(st_cons)) + "): " +
+                           join(consumer));
+    // A producer killed by SIGPIPE is fine; only flag a real non-zero exit.
+    if (WIFEXITED(st_prod) && WEXITSTATUS(st_prod) != 0)
+        throw CommandError("producer failed (rc=" +
+                           std::to_string(WEXITSTATUS(st_prod)) + "): " +
+                           join(producer));
+}
+
+}  // namespace sp

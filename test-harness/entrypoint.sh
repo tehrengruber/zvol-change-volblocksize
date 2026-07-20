@@ -6,8 +6,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="${REPO_DIR:-$(cd "$HERE/.." && pwd)}"
-CACHE_DIR="${CACHE_DIR:-/var/cache/zvol-reblock}"
-WORK_DIR="${WORK_DIR:-$(mktemp -d /tmp/zvol-reblock.XXXXXX)}"
+CACHE_DIR="${CACHE_DIR:-/var/cache/zvol-change-volblocksize}"
+WORK_DIR="${WORK_DIR:-$(mktemp -d /tmp/zvol-change-volblocksize.XXXXXX)}"
 IMG_URL="${IMG_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img}"
 TIMEOUT="${TIMEOUT:-1800}"
 MEM="${MEM:-4096}"
@@ -58,12 +58,12 @@ set -e
 result=""
 [ -f "$OUTDIR/result" ] && result="$(tr -dc '0-9' < "$OUTDIR/result")"
 if [ -z "$result" ]; then
-    result="$(grep -aoE 'ZVOL_REBLOCK_RESULT:[0-9]+' "$LOG" | tail -1 | cut -d: -f2 || true)"
+    result="$(grep -aoE 'ZVOL_CVB_RESULT:[0-9]+' "$LOG" | tail -1 | cut -d: -f2 || true)"
 fi
 if [ -z "$result" ]; then
     echo ">> FAILURE: no result sentinel (qemu rc=$qemu_rc, likely timeout/boot failure)"
     exit 1
 fi
-[ -f "$OUTDIR/pytest.log" ] && echo ">> guest pytest.log saved at $OUTDIR/pytest.log"
-echo ">> guest pytest exit code: $result"
+[ -f "$OUTDIR/ctest.log" ] && echo ">> guest ctest.log saved at $OUTDIR/ctest.log"
+echo ">> guest ctest exit code: $result"
 exit "$result"

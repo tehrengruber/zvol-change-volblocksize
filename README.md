@@ -1,4 +1,4 @@
-# zvol-reblock
+# zvol-change-volblocksize
 
 Change a ZFS zvol's `volblocksize` **while retaining its entire snapshot
 history**.
@@ -40,6 +40,20 @@ The send stream and its `zstream dump` output are consumed **streaming**, line
 by line — nothing is spilled to disk or held whole in memory, so arbitrarily
 large deltas are fine.
 
+## Building
+
+A single C++20 binary with no third-party dependencies; built with CMake:
+
+```console
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+# -> build/zvol-change-volblocksize
+sudo cmake --install build   # optional: installs to <prefix>/bin
+```
+
+Prebuilt `.deb` packages (for Debian trixie) are attached to GitHub releases; you
+can also produce one locally with `cpack -G DEB` from the build directory.
+
 ## Requirements & preconditions
 
 - OpenZFS with `zfs`, `zpool`, and `zstream` (or the older `zstreamdump`).
@@ -57,7 +71,7 @@ zfs snapshot pool/vol@now          # if the current head isn't already a snapsho
 zfs set readonly=on pool/vol
 
 # migrate 8k -> 16k, keeping pool/vol-old as a backup
-sudo ./zvol_reblock.py pool/vol 16k
+sudo zvol-change-volblocksize pool/vol 16k
 
 # inspect the result, then drop the backup when satisfied
 zfs destroy -r pool/vol-old
@@ -86,32 +100,33 @@ Options:
 
 ## Testing
 
+The tests are C++ (registered with CTest) and drive real ZFS pools on loop files.
 ZFS needs a kernel module, which is awkward to install on the host (especially
-Arch). The suite therefore runs inside a disposable Ubuntu QEMU/KVM guest.
+Arch), so the suite runs inside a disposable Ubuntu QEMU/KVM guest.
+
+**In a disposable guest (recommended).** Both entry points download an Ubuntu
+cloud image (cached), boot it, install ZFS and a C++ toolchain, mount this repo
+over 9p read-only, build with CMake, run CTest, and exit with its status:
 
 ```console
-# Podman-wrapped (needs /dev/kvm):
+# Podman-wrapped (needs /dev/kvm on the host):
 ./test-harness/run.sh
 
-# or drive QEMU directly (needs qemu + xorriso + curl on the host):
+# or drive QEMU directly (needs qemu + qemu-img + xorriso + curl on the host):
 ./test-harness/run-qemu.sh
-
-# convenience:
-make test          # -> run.sh
-make test-qemu     # -> run-qemu.sh
 ```
 
-Either path downloads an Ubuntu cloud image (cached), boots it, installs
-`zfsutils-linux`, mounts this repo over 9p read-only, and runs `pytest`. The
-container/script exits with the guest's pytest exit code.
+Useful environment overrides for the QEMU path: `CACHE_DIR` (where the cloud
+image is cached), `TIMEOUT`, `MEM`, `SMP`.
 
-If you already have a working ZFS environment and just want to run the tests
-directly there:
+**Directly, if you already have a working ZFS (needs root).** Each test creates a
+throwaway pool on a loop file; without root/ZFS a test reports SKIP:
 
 ```console
-sudo python3 -m pytest -v tests/
+cmake -S . -B build && cmake --build build
+sudo ctest --test-dir build --output-on-failure
 ```
 
 Tests cover: per-snapshot byte-for-byte content across smaller and larger target
 block sizes, single-snapshot volumes, hole/`FREE` replication with sparseness,
-and `volsize` increasing and decreasing across snapshots.
+`volsize` increasing and decreasing across snapshots, and property carry-over.

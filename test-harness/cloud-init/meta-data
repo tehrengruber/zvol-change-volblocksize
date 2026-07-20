@@ -1,2 +1,2 @@
-instance-id: zvol-reblock-0
-local-hostname: zvol-reblock
+instance-id: zvol-change-volblocksize-0
+local-hostname: zvol-change-volblocksize

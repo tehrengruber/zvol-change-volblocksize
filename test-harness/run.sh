@@ -5,13 +5,13 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(cd "$HERE/.." && pwd)"
-IMAGE="${IMAGE:-zvol-reblock-test}"
+IMAGE="${IMAGE:-zvol-change-volblocksize-test}"
 
 podman build -t "$IMAGE" "$HERE"
 
 exec podman run --rm -it \
     --device /dev/kvm \
     -v "$REPO_DIR":/repo:ro,Z \
-    -v zvol-reblock-cache:/cache \
+    -v zvol-change-volblocksize-cache:/cache \
     -e REPO_DIR=/repo \
     "$IMAGE"

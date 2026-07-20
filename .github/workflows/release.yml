@@ -1,0 +1,52 @@
+name: build-and-release
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write  # needed to create releases on tag builds
+
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build and package inside real Debian trixie so the binary links against
+      # trixie's libc/libstdc++ and the .deb's dependencies are computed for it.
+      - name: Compile and package (.deb) on Debian trixie
+        run: |
+          docker run --rm -v "$PWD":/src -w /src debian:trixie bash -euxc '
+            apt-get update
+            apt-get install -y --no-install-recommends \
+              build-essential cmake dpkg-dev file
+            # Compiles everything (tool + tests); packaging installs only the tool.
+            cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+            cmake --build build -j"$(nproc)"
+            ( cd build && cpack -G DEB )
+          '
+
+      - name: Show package info
+        run: |
+          ls -l build/*.deb
+          dpkg-deb --info build/*.deb
+
+      # Untagged build (branch push / PR / manual): keep the .deb as an artifact.
+      - name: Upload artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zvol-change-volblocksize-deb
+          path: build/*.deb
+
+      # Tagged build: publish a GitHub release with the .deb attached.
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: build/*.deb
+          generate_release_notes: true
