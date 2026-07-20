@@ -147,3 +147,13 @@ sudo ctest --test-dir build --output-on-failure
 Tests cover: per-snapshot byte-for-byte content across smaller and larger target
 block sizes, single-snapshot volumes, hole/`FREE` replication with sparseness,
 `volsize` increasing and decreasing across snapshots, and property carry-over.
+
+## License & disclaimer
+
+Licensed under the [MIT License](LICENSE).
+
+This tool was written partially with the help of AI tools. It manipulates real
+storage and, when swapping names, the original dataset. **Use at your own risk** —
+there is no warranty of any kind (see the LICENSE). Review the code, keep backups,
+and try it on non-critical data first; `--no-swap` and `--verify all` are there to
+let you inspect and validate the result before committing to it.

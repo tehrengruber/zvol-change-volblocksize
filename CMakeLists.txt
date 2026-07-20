@@ -37,6 +37,7 @@ set(CPACK_PACKAGE_NAME "zvol-change-volblocksize")
 set(CPACK_PACKAGE_CONTACT "Till Ehrengruber <till@ehrengruber.ch>")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY
     "Change a ZFS zvol's volblocksize while retaining all snapshots")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 set(CPACK_DEBIAN_PACKAGE_SECTION "admin")
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "zfsutils-linux")
 set(CPACK_DEBIAN_PACKAGE_SHLIBDEPS ON)  # auto libc/libstdc++ dependencies
