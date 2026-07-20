@@ -354,6 +354,14 @@ class Progress {
                   << std::flush;
     }
 
+    // Print a line that coexists with the bar: on a terminal, clear the current
+    // bar line first and let the next update() redraw it underneath.
+    void message(const std::string& msg) {
+        if (tty_) std::cerr << "\r\033[K";
+        std::cerr << msg << "\n" << std::flush;
+        drawn_ = false;
+    }
+
    private:
 
     std::string label_;
@@ -491,6 +499,7 @@ struct Options {
     bool dry_run = false;
     bool verbose = false;
     VerifyMode verify = VerifyMode::None;
+    bool verify_only = false;  // just compare an existing dest; no transfer
 };
 
 Options g_opts;
@@ -596,20 +605,24 @@ void replay(const std::string& dest, uint64_t blocksize,
     Progress progress(std::to_string(snapshots.size() - start) + " snapshots", total,
                       blocksize);
     uint64_t done = 0;  // bytes written so far across all replayed snapshots
+    // Verbose lines are routed through the bar so they don't collide with it.
+    auto vlog = [&](const std::string& m) {
+        if (g_opts.verbose) progress.message("[zvol-change-volblocksize] " + m);
+    };
 
     for (size_t i = start; i < snapshots.size(); ++i) {
         const std::string& snap = snapshots[i];
         std::string shortname = snap.substr(snap.find('@') + 1);
         uint64_t snap_volsize = to_u64(zfs_get(snap, "volsize"), "snapshot volsize");
         uint64_t dst_volsize = align_up(snap_volsize, blocksize);
-        log("snapshot " + shortname + ": volsize=" + std::to_string(snap_volsize) +
-            " (dest " + std::to_string(dst_volsize) + ")");
+        vlog("snapshot " + shortname + ": volsize=" + std::to_string(snap_volsize) +
+             " (dest " + std::to_string(dst_volsize) + ")");
         run_mutate({"zfs", "set", "volsize=" + std::to_string(dst_volsize), dest});
 
         std::vector<std::string> send_cmd = send_command(snapshots, i);
         uint64_t estimate = estimates[i];
-        log("+ " + sp::join(send_cmd) + " | " + sp::join(zstream_cmd) + "  (~" +
-            std::to_string(estimate) + " bytes)");
+        vlog("+ " + sp::join(send_cmd) + " | " + sp::join(zstream_cmd) + "  (~" +
+             std::to_string(estimate) + " bytes)");
 
         std::string src_dev = wait_for_device("/dev/zvol/" + snap);
         wait_for_device(dst_dev);
@@ -634,20 +647,21 @@ void replay(const std::string& dest, uint64_t blocksize,
         }
         close(dst_fd);
         done += wrote;
-        log("  wrote " + std::to_string(wrote) + " bytes, freed " +
-            std::to_string(freed) + " bytes (estimate " + std::to_string(estimate) +
-            ")");
+        vlog("  wrote " + std::to_string(wrote) + " bytes, freed " +
+             std::to_string(freed) + " bytes (estimate " + std::to_string(estimate) +
+             ")");
 
         // Sanity-check against the estimate: the dry-run size is not exact (stream
         // overhead), so this is only a warning, and only past 10% (the small
-        // absolute floor keeps tiny/free-only increments from tripping it).
+        // absolute floor keeps tiny/free-only increments from tripping it).  Routed
+        // through the bar so it doesn't collide with the in-place progress line.
         if (estimate > 0) {
             uint64_t diff = wrote > estimate ? wrote - estimate : estimate - wrote;
             if (diff > 128 * 1024 && diff * 10 > estimate)
-                std::cerr << "warning: size drift for " << shortname
-                          << ": ZFS estimated ~" << human(estimate)
-                          << " of changes but " << human(wrote)
-                          << " were written (>10%)\n";
+                progress.message("warning: size drift for " + shortname +
+                                 ": ZFS estimated ~" + human(estimate) +
+                                 " of changes but " + human(wrote) +
+                                 " were written (>10%)");
         }
 
         run_mutate({"zfs", "snapshot", dest + "@" + shortname});
@@ -661,10 +675,12 @@ uint64_t volsize_of(const std::string& dataset) {
     return to_u64(zfs_get(dataset, "volsize"), dataset + " volsize");
 }
 
-// Byte-compare the first `size` bytes of two devices.  Throws on a read error --
-// which is a different fact from a content difference (the latter returns false).
+// Byte-compare the first `size` bytes of two devices, reporting cumulative bytes
+// read via `on_progress`.  Throws on a read error -- which is a different fact
+// from a content difference (the latter returns false).
 bool devices_identical(const std::string& dev_a, const std::string& dev_b,
-                       uint64_t size) {
+                       uint64_t size,
+                       const std::function<void(uint64_t)>& on_progress = {}) {
     int fa = open(dev_a.c_str(), O_RDONLY);
     int fb = open(dev_b.c_str(), O_RDONLY);
     if (fa < 0 || fb < 0) {
@@ -676,6 +692,7 @@ bool devices_identical(const std::string& dev_a, const std::string& dev_b,
     bool equal = true;
     try {
         for (uint64_t pos = 0; pos < size && equal;) {
+            throw_if_interrupted();
             size_t n = std::min<uint64_t>(CHUNK, size - pos);
             if (!sp::pread_full(fa, ba.data(), n, pos) ||
                 !sp::pread_full(fb, bb.data(), n, pos))
@@ -683,6 +700,7 @@ bool devices_identical(const std::string& dev_a, const std::string& dev_b,
                                    std::to_string(pos));
             if (std::memcmp(ba.data(), bb.data(), n) != 0) equal = false;
             pos += n;
+            if (on_progress) on_progress(pos);
         }
     } catch (...) {
         close(fa);
@@ -695,7 +713,8 @@ bool devices_identical(const std::string& dev_a, const std::string& dev_b,
 }
 
 // True if [offset, offset+size) of the device reads back as all zeros.
-bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size) {
+bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size,
+                    const std::function<void(uint64_t)>& on_progress = {}) {
     int fd = open(dev.c_str(), O_RDONLY);
     if (fd < 0) throw MigrateError("cannot open device to verify: " + dev);
     std::vector<char> buf(CHUNK);
@@ -703,12 +722,14 @@ bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size) {
     bool zero = true;
     try {
         for (uint64_t pos = 0; pos < size && zero;) {
+            throw_if_interrupted();
             size_t n = std::min<uint64_t>(CHUNK, size - pos);
             if (!sp::pread_full(fd, buf.data(), n, offset + pos))
                 throw MigrateError("read error while verifying tail at offset " +
                                    std::to_string(offset + pos));
             if (std::memcmp(buf.data(), zeros.data(), n) != 0) zero = false;
             pos += n;
+            if (on_progress) on_progress(pos);
         }
     } catch (...) {
         close(fd);
@@ -719,35 +740,56 @@ bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size) {
 }
 
 // Byte-compare the migrated volume against the original.  With All, every snapshot
-// is compared; the live head (the result) is always compared.  Runs before the
-// swap so a failure leaves the original untouched.
+// is compared; the live head (the result) is always compared.  Shows one progress
+// bar across all comparisons.  Runs before the swap so a failure leaves the
+// original untouched.
 void verify(const std::string& new_ds, const std::string& orig_ds,
             VerifyMode mode) {
-    auto check = [&](const std::string& a, const std::string& b,
-                     const std::string& what) {
-        uint64_t sa = volsize_of(a), sb = volsize_of(b);
-        uint64_t common = std::min(sa, sb);
-        std::string da = wait_for_device("/dev/zvol/" + a);
-        std::string db = wait_for_device("/dev/zvol/" + b);
-        if (!devices_identical(da, db, common))
-            throw MigrateError("verification FAILED: " + what +
-                               " is not byte-identical to the original");
-        // If the destination was rounded up to the new blocksize, the extra tail
-        // must read as zeros (what the README promises for that region).
-        if (sa != sb) {
-            const std::string& bigger = sa > sb ? da : db;
-            if (!device_is_zero(bigger, common, std::max(sa, sb) - common))
-                throw MigrateError("verification FAILED: rounded-up tail of " +
-                                   what + " is not all zeros");
-        }
-        log("verified " + what + " (" + human(common) + " identical)");
+    struct Item {
+        std::string a, b, what;
+        uint64_t sa, sb;
+    };
+    std::vector<Item> items;
+    auto add = [&](const std::string& a, const std::string& b,
+                   const std::string& what) {
+        items.push_back({a, b, what, volsize_of(a), volsize_of(b)});
     };
     if (mode == VerifyMode::All)
         for (const auto& snap : list_snapshots(orig_ds)) {
             std::string sh = snap.substr(snap.find('@') + 1);
-            check(new_ds + "@" + sh, orig_ds + "@" + sh, "snapshot " + sh);
+            add(new_ds + "@" + sh, orig_ds + "@" + sh, "snapshot " + sh);
         }
-    check(new_ds, orig_ds, "head");
+    add(new_ds, orig_ds, "head");
+
+    uint64_t total = 0;
+    for (const auto& it : items) total += std::max(it.sa, it.sb);
+    Progress progress("verifying " + std::to_string(items.size()) + " items", total,
+                      1024 * 1024);
+    uint64_t done = 0;
+
+    for (const auto& it : items) {
+        uint64_t common = std::min(it.sa, it.sb);
+        std::string da = wait_for_device("/dev/zvol/" + it.a);
+        std::string db = wait_for_device("/dev/zvol/" + it.b);
+        if (!devices_identical(da, db, common,
+                               [&](uint64_t n) { progress.update(done + n); }))
+            throw MigrateError("verification FAILED: " + it.what +
+                               " is not byte-identical to the original");
+        // If the destination was rounded up to the new blocksize, the extra tail
+        // must read as zeros (what the README promises for that region).
+        if (it.sa != it.sb) {
+            const std::string& bigger = it.sa > it.sb ? da : db;
+            if (!device_is_zero(bigger, common, std::max(it.sa, it.sb) - common,
+                                [&](uint64_t n) { progress.update(done + common + n); }))
+                throw MigrateError("verification FAILED: rounded-up tail of " +
+                                   it.what + " is not all zeros");
+        }
+        done += std::max(it.sa, it.sb);
+        if (g_opts.verbose)
+            progress.message("[zvol-change-volblocksize] verified " + it.what + " (" +
+                             human(common) + " identical)");
+    }
+    progress.finish(done);
     std::cout << "Verification passed ("
               << (mode == VerifyMode::All ? "all snapshots + head" : "head")
               << " byte-identical)." << std::endl;
@@ -805,7 +847,32 @@ bool prop_is_set(const std::string& v) {
     return !v.empty() && v != "0" && v != "none" && v != "-";
 }
 
+// Compare an existing destination against the source, no transfer.  Useful to
+// re-check a --no-swap result, or a post-swap pair (source = the -old backup,
+// --dest = the migrated volume at the original name).
+void verify_only() {
+    std::string dest = g_opts.dest.empty() ? g_opts.source + "-new" : g_opts.dest;
+    if (sp::run_quiet({"zfs", "list", dest}) != 0)
+        throw MigrateError(
+            dest + " does not exist; nothing to verify (pass --dest, or run a "
+            "migration with --no-swap first)");
+    if (zfs_get(g_opts.source, "type") != "volume")
+        throw MigrateError(g_opts.source + " is not a zvol");
+    VerifyMode mode =
+        g_opts.verify != VerifyMode::None ? g_opts.verify : VerifyMode::All;
+    // Make both sides' snapshot device nodes visible for the comparison.
+    std::optional<ScopedProp> gsrc, gdst;
+    gsrc.emplace(g_opts.source, "snapdev", "visible");
+    gdst.emplace(dest, "snapdev", "visible");
+    verify(dest, g_opts.source, mode);
+}
+
 void migrate() {
+    if (g_opts.verify_only) {
+        verify_only();
+        return;
+    }
+
     uint64_t blocksize = parse_size(g_opts.volblocksize);
     if (blocksize < 512u || (blocksize & (blocksize - 1)) != 0)
         throw MigrateError(
@@ -1017,6 +1084,8 @@ const char* USAGE =
     "  --verify MODE         after copying, byte-compare against the original\n"
     "                        (MODE: head = the result only; all = every snapshot\n"
     "                        + head).  Runs before the swap; fails on any mismatch.\n"
+    "  --verify-only         only byte-compare an existing --dest against the\n"
+    "                        source (no transfer); uses --verify MODE, default all\n"
     "  --dry-run             print planned actions without changing anything\n"
     "  -v, --verbose\n";
 
@@ -1053,6 +1122,8 @@ bool parse_args(int argc, char** argv) {
             else if (m == "head") g_opts.verify = VerifyMode::Head;
             else if (m == "none") g_opts.verify = VerifyMode::None;
             else throw MigrateError("--verify expects: none | head | all");
+        } else if (a == "--verify-only") {
+            g_opts.verify_only = true;
         } else if (a == "--dry-run") {
             g_opts.dry_run = true;
         } else if (a == "-v" || a == "--verbose") {
@@ -1062,6 +1133,16 @@ bool parse_args(int argc, char** argv) {
         } else {
             positional.push_back(a);
         }
+    }
+    if (g_opts.verify_only) {
+        if (positional.empty() || positional.size() > 2) {
+            std::cerr << USAGE;
+            throw MigrateError("with --verify-only, expected <source-zvol> "
+                               "[volblocksize (ignored)]");
+        }
+        g_opts.source = positional[0];
+        if (positional.size() == 2) g_opts.volblocksize = positional[1];
+        return true;
     }
     if (positional.size() != 2) {
         std::cerr << USAGE;
