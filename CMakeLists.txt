@@ -15,6 +15,15 @@ target_include_directories(zcvb_common PUBLIC src)
 add_executable(zvol-change-volblocksize src/main.cpp)
 target_link_libraries(zvol-change-volblocksize PRIVATE zcvb_common)
 
+# Optional fully-static build: a single dependency-free binary that needs no
+# installation.  Best paired with a musl toolchain (e.g. an Alpine container) for
+# a truly portable result; also works with a glibc toolchain that ships static
+# libs.  The tool touches no NSS/locale APIs, so static linking is safe here.
+option(ZCVB_STATIC "Link the tool as a fully static, dependency-free binary" OFF)
+if(ZCVB_STATIC)
+  target_link_options(zvol-change-volblocksize PRIVATE -static)
+endif()
+
 install(TARGETS zvol-change-volblocksize RUNTIME DESTINATION bin)
 
 include(CTest)  # defines BUILD_TESTING (default ON) and calls enable_testing()

@@ -51,8 +51,21 @@ cmake --build build
 sudo cmake --install build   # optional: installs to <prefix>/bin
 ```
 
-Prebuilt `.deb` packages (for Debian trixie) are attached to GitHub releases; you
-can also produce one locally with `cpack -G DEB` from the build directory.
+**Prebuilt binaries** are attached to GitHub releases:
+
+- a **`.deb`** for Debian trixie (also buildable locally with `cpack -G DEB` from
+  the build directory), and
+- a **fully static binary** (`zvol-change-volblocksize-static-linux-x86_64`) that
+  needs no installation — download it, `chmod +x`, and run. It still needs the
+  `zfs`/`zpool`/`zstream` userland present at runtime, but has no library
+  dependencies of its own.
+
+To build the static binary yourself, add `-DZCVB_STATIC=ON` (best with a musl
+toolchain, e.g. inside an Alpine container, for maximum portability):
+
+```console
+cmake -S . -B build-static -DZCVB_STATIC=ON && cmake --build build-static
+```
 
 ## Requirements & preconditions
 

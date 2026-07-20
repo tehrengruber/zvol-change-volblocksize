@@ -50,3 +50,38 @@ jobs:
         with:
           files: build/*.deb
           generate_release_notes: true
+
+  static-binary:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # musl + -static => a single, fully static binary that runs on any Linux
+      # x86-64 with no installation and no shared-library dependencies.
+      - name: Build static musl binary (Alpine)
+        run: |
+          docker run --rm -v "$PWD":/src -w /src alpine:3.20 sh -euxc '
+            apk add --no-cache build-base cmake linux-headers
+            cmake -S . -B build-static -DCMAKE_BUILD_TYPE=Release \
+              -DZCVB_STATIC=ON -DBUILD_TESTING=OFF
+            cmake --build build-static -j"$(nproc)"
+            strip build-static/zvol-change-volblocksize
+          '
+          cp build-static/zvol-change-volblocksize \
+             zvol-change-volblocksize-static-linux-x86_64
+
+      - name: Verify it is static
+        run: file zvol-change-volblocksize-static-linux-x86_64 | grep -q 'statically linked'
+
+      - name: Upload artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: zvol-change-volblocksize-static
+          path: zvol-change-volblocksize-static-linux-x86_64
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: zvol-change-volblocksize-static-linux-x86_64
