@@ -4,7 +4,8 @@ add_executable(zvol_tests
   test_content.cpp
   test_volsize.cpp
   test_holes.cpp
-  test_properties.cpp)
+  test_properties.cpp
+  test_head.cpp)
 target_link_libraries(zvol_tests PRIVATE zcvb_common)
 
 # Each test is its own process (creates a throwaway pool on a loop file); it
@@ -12,7 +13,8 @@ target_link_libraries(zvol_tests PRIVATE zcvb_common)
 # concurrent pools from contending.
 set(cvb_tests
   content_larger content_smaller single_snapshot no_swap
-  holes volsize_increases volsize_decreases properties)
+  holes volsize_increases volsize_decreases properties
+  head_is_newest_snapshot)
 foreach(t IN LISTS cvb_tests)
   add_test(NAME ${t}
            COMMAND zvol_tests ${t} $<TARGET_FILE:zvol-change-volblocksize>)
