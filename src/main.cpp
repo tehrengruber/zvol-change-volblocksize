@@ -19,7 +19,10 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cerrno>
+#include <charconv>
 #include <chrono>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -41,6 +44,14 @@ namespace {
 struct MigrateError : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
+
+// Set by the SIGINT handler and checked at safe points so Ctrl-C unwinds through
+// the normal exception path (cleanup note prints; pipeline children are reaped).
+volatile std::sig_atomic_t g_interrupted = 0;
+void on_sigint(int) { g_interrupted = 1; }
+void throw_if_interrupted() {
+    if (g_interrupted) throw MigrateError("interrupted");
+}
 
 // ---- zvol / send-stream constants ---------------------------------------- //
 
@@ -105,6 +116,25 @@ std::map<std::string, std::string> kv_pairs(const std::vector<std::string>& t) {
 
 uint64_t align_up(uint64_t v, uint64_t mult) { return (v + mult - 1) / mult * mult; }
 
+// Parse an unsigned integer from ZFS/zstream output, with an actionable error
+// (rather than a bare std::stoull "stoull" exception) if it isn't a number.
+uint64_t to_u64(const std::string& s, const std::string& what) {
+    uint64_t v = 0;
+    auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc() || p != s.data() + s.size())
+        throw MigrateError(what + ": expected a number but got '" + s + "'");
+    return v;
+}
+
+// Same, but for a possibly-signed value (FREE length can be -1); returns int64.
+int64_t to_i64(const std::string& s, const std::string& what) {
+    int64_t v = 0;
+    auto [p, ec] = std::from_chars(s.data(), s.data() + s.size(), v);
+    if (ec != std::errc() || p != s.data() + s.size())
+        throw MigrateError(what + ": expected a number but got '" + s + "'");
+    return v;
+}
+
 // ---- zfs command wrappers ------------------------------------------------ //
 
 std::string zfs_get(const std::string& ds, const std::string& prop) {
@@ -156,7 +186,8 @@ std::string wait_for_device(const std::string& path, double timeout_s = 15.0) {
         if (std::filesystem::exists(path)) return path;
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
-    throw MigrateError("device node did not appear: " + path);
+    throw MigrateError("device node did not appear: " + path +
+                       " (is snapdev=visible set, and is udev running?)");
 }
 
 // ---- streaming parse of "zfs send | zstream dump -v" --------------------- //
@@ -184,8 +215,8 @@ Change classify(const std::string& rtype,
     if (rtype == "FREEOBJECTS") {
         // A zvol send frees exactly the unused tail of the first meta-dnode block,
         // objects [3, 32), leaving data (1) and props (2) intact.  Assert that.
-        uint64_t firstobj = std::stoull(f.at("firstobj"));
-        uint64_t numobjs = std::stoull(f.at("numobjs"));
+        uint64_t firstobj = to_u64(f.at("firstobj"), "FREEOBJECTS firstobj");
+        uint64_t numobjs = to_u64(f.at("numobjs"), "FREEOBJECTS numobjs");
         if (firstobj != FREEOBJECTS_FIRST ||
             firstobj + numobjs != DNODES_PER_BLOCK)
             throw MigrateError("unexpected FREEOBJECTS firstobj=" +
@@ -198,21 +229,21 @@ Change classify(const std::string& rtype,
     }
 
     if (rtype == "FREE" || rtype.rfind("WRITE", 0) == 0) {
-        uint64_t obj = std::stoull(f.at("object"));
+        uint64_t obj = to_u64(f.at("object"), rtype + " object");
         if (obj == ZVOL_ZAP_OBJ) return {};  // props; volsize handled separately
         if (obj != ZVOL_OBJ)
             throw MigrateError("unexpected " + rtype + " to object " +
                                std::to_string(obj) + " (only the zvol data object " +
                                std::to_string(ZVOL_OBJ) + " is expected)");
-        uint64_t offset = std::stoull(f.at("offset"));
+        uint64_t offset = to_u64(f.at("offset"), rtype + " offset");
         if (rtype == "FREE")
-            return {Op::Free, offset, std::stoll(f.at("length"))};
+            return {Op::Free, offset, to_i64(f.at("length"), "FREE length")};
         // WRITE / WRITE_EMBEDDED / WRITE_BYREF: we only need the changed range;
         // the bytes come from the snapshot device, so the encoding is moot.
         for (const char* key : {"logical_size", "lsize", "length"}) {
             auto it = f.find(key);
             if (it != f.end())
-                return {Op::Write, offset, std::stoll(it->second)};
+                return {Op::Write, offset, to_i64(it->second, "WRITE size")};
         }
         throw MigrateError(rtype + " record without a length field");
     }
@@ -315,11 +346,22 @@ class RangeApplier {
         uint64_t pos = pend_start_, end = pend_end_;
         have_pending_ = false;
         while (pos < end) {
+            throw_if_interrupted();
             size_t want = std::min<uint64_t>(CHUNK, end - pos);
             ssize_t got = pread(src_fd_, buf_.data(), want, pos);
-            if (got <= 0) break;  // past end of source snapshot; rest are holes
+            if (got < 0)
+                throw MigrateError("read error on source device at offset " +
+                                   std::to_string(pos) + ": " +
+                                   std::strerror(errno));
+            if (got == 0)
+                throw MigrateError(
+                    "unexpected EOF on source device at offset " +
+                    std::to_string(pos) +
+                    " (a WRITE record lies past the end of the snapshot; the send "
+                    "stream and the device disagree)");
             if (pwrite(dst_fd_, buf_.data(), got, pos) != got)
-                throw MigrateError("short write to destination");
+                throw MigrateError("short write to destination at offset " +
+                                   std::to_string(pos));
             bytes_written_ += static_cast<uint64_t>(got);
             pos += static_cast<uint64_t>(got);
             if (on_progress_) on_progress_(bytes_written_);
@@ -392,6 +434,7 @@ struct Options {
     bool no_swap = false;
     bool keep_backup = true;
     bool force = false;
+    bool allow_decrypt = false;
     bool dry_run = false;
     bool verbose = false;
     VerifyMode verify = VerifyMode::None;
@@ -413,17 +456,26 @@ void run_mutate(const std::vector<std::string>& args) {
     sp::check_call(args);
 }
 
+// Strict size parse: an integer with an optional b/k/m/g suffix, rejecting any
+// trailing junk (std::stod would silently accept "12x3k").
 uint64_t parse_size(const std::string& text) {
     std::string t = trim(text);
-    if (t.empty()) throw MigrateError("empty size");
-    char suffix = static_cast<char>(std::tolower(t.back()));
-    if (std::isdigit(static_cast<unsigned char>(suffix)))
-        return std::stoull(t);
-    static const std::map<char, uint64_t> units = {
-        {'b', 1}, {'k', 1024}, {'m', 1024ull * 1024}, {'g', 1024ull * 1024 * 1024}};
-    auto it = units.find(suffix);
-    if (it == units.end()) throw MigrateError("invalid size: " + text);
-    return static_cast<uint64_t>(std::stod(t.substr(0, t.size() - 1)) * it->second);
+    uint64_t mult = 1;
+    if (!t.empty() && !std::isdigit(static_cast<unsigned char>(t.back()))) {
+        switch (std::tolower(static_cast<unsigned char>(t.back()))) {
+            case 'b': mult = 1; break;
+            case 'k': mult = 1024; break;
+            case 'm': mult = 1024ull * 1024; break;
+            case 'g': mult = 1024ull * 1024 * 1024; break;
+            default: throw MigrateError("invalid size suffix in: " + text);
+        }
+        t.pop_back();
+    }
+    uint64_t v = 0;
+    auto [p, ec] = std::from_chars(t.data(), t.data() + t.size(), v);
+    if (ec != std::errc() || p != t.data() + t.size())
+        throw MigrateError("invalid size: " + text + " (expected e.g. 8192, 16k, 1m)");
+    return v * mult;
 }
 
 void create_dest(const std::string& dest, uint64_t blocksize, uint64_t volsize) {
@@ -450,7 +502,7 @@ uint64_t estimate_change(const std::vector<std::string>& send_cmd) {
     try {
         for (const auto& line : split_lines(sp::check_output(cmd))) {
             std::vector<std::string> t = split_ws(line);
-            if (t.size() >= 2 && t[0] == "size") return std::stoull(t[1]);
+            if (t.size() >= 2 && t[0] == "size") return to_u64(t[1], "send -nP size");
         }
     } catch (const std::exception&) {
     }
@@ -465,7 +517,7 @@ void replay(const std::string& dest, uint64_t blocksize,
     for (size_t i = 0; i < snapshots.size(); ++i) {
         const std::string& snap = snapshots[i];
         std::string shortname = snap.substr(snap.find('@') + 1);
-        uint64_t snap_volsize = std::stoull(zfs_get(snap, "volsize"));
+        uint64_t snap_volsize = to_u64(zfs_get(snap, "volsize"), "snapshot volsize");
         uint64_t dst_volsize = align_up(snap_volsize, blocksize);
         log("snapshot " + shortname + ": volsize=" + std::to_string(snap_volsize) +
             " (dest " + std::to_string(dst_volsize) + ")");
@@ -501,6 +553,7 @@ void replay(const std::string& dest, uint64_t blocksize,
             RangeApplier applier(src_dev, dst_fd, blocksize, dst_volsize);
             applier.set_progress([&](uint64_t w) { progress.update(w); });
             for_each_change(send_cmd, zstream_cmd, [&](const Change& c) {
+                throw_if_interrupted();
                 if (c.op == Op::Write)
                     applier.write(c.offset, static_cast<uint64_t>(c.length));
                 else
@@ -537,9 +590,11 @@ void replay(const std::string& dest, uint64_t blocksize,
 // ---- verification -------------------------------------------------------- //
 
 uint64_t volsize_of(const std::string& dataset) {
-    return std::stoull(zfs_get(dataset, "volsize"));
+    return to_u64(zfs_get(dataset, "volsize"), dataset + " volsize");
 }
 
+// Byte-compare the first `size` bytes of two devices.  Throws on a read error --
+// which is a different fact from a content difference (the latter returns false).
 bool devices_identical(const std::string& dev_a, const std::string& dev_b,
                        uint64_t size) {
     int fa = open(dev_a.c_str(), O_RDONLY);
@@ -551,19 +606,48 @@ bool devices_identical(const std::string& dev_a, const std::string& dev_b,
     }
     std::vector<char> ba(CHUNK), bb(CHUNK);
     bool equal = true;
-    for (uint64_t pos = 0; pos < size && equal;) {
-        size_t n = std::min<uint64_t>(CHUNK, size - pos);
-        if (pread(fa, ba.data(), n, pos) != static_cast<ssize_t>(n) ||
-            pread(fb, bb.data(), n, pos) != static_cast<ssize_t>(n)) {
-            equal = false;
-            break;
+    try {
+        for (uint64_t pos = 0; pos < size && equal;) {
+            size_t n = std::min<uint64_t>(CHUNK, size - pos);
+            if (!sp::pread_full(fa, ba.data(), n, pos) ||
+                !sp::pread_full(fb, bb.data(), n, pos))
+                throw MigrateError("read error while verifying at offset " +
+                                   std::to_string(pos));
+            if (std::memcmp(ba.data(), bb.data(), n) != 0) equal = false;
+            pos += n;
         }
-        if (std::memcmp(ba.data(), bb.data(), n) != 0) equal = false;
-        pos += n;
+    } catch (...) {
+        close(fa);
+        close(fb);
+        throw;
     }
     close(fa);
     close(fb);
     return equal;
+}
+
+// True if [offset, offset+size) of the device reads back as all zeros.
+bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size) {
+    int fd = open(dev.c_str(), O_RDONLY);
+    if (fd < 0) throw MigrateError("cannot open device to verify: " + dev);
+    std::vector<char> buf(CHUNK);
+    static const std::vector<char> zeros(CHUNK, 0);
+    bool zero = true;
+    try {
+        for (uint64_t pos = 0; pos < size && zero;) {
+            size_t n = std::min<uint64_t>(CHUNK, size - pos);
+            if (!sp::pread_full(fd, buf.data(), n, offset + pos))
+                throw MigrateError("read error while verifying tail at offset " +
+                                   std::to_string(offset + pos));
+            if (std::memcmp(buf.data(), zeros.data(), n) != 0) zero = false;
+            pos += n;
+        }
+    } catch (...) {
+        close(fd);
+        throw;
+    }
+    close(fd);
+    return zero;
 }
 
 // Byte-compare the migrated volume against the original.  With All, every snapshot
@@ -573,13 +657,22 @@ void verify(const std::string& new_ds, const std::string& orig_ds,
             VerifyMode mode) {
     auto check = [&](const std::string& a, const std::string& b,
                      const std::string& what) {
-        uint64_t size = std::min(volsize_of(a), volsize_of(b));
+        uint64_t sa = volsize_of(a), sb = volsize_of(b);
+        uint64_t common = std::min(sa, sb);
         std::string da = wait_for_device("/dev/zvol/" + a);
         std::string db = wait_for_device("/dev/zvol/" + b);
-        if (!devices_identical(da, db, size))
+        if (!devices_identical(da, db, common))
             throw MigrateError("verification FAILED: " + what +
                                " is not byte-identical to the original");
-        log("verified " + what + " (" + human(size) + " identical)");
+        // If the destination was rounded up to the new blocksize, the extra tail
+        // must read as zeros (what the README promises for that region).
+        if (sa != sb) {
+            const std::string& bigger = sa > sb ? da : db;
+            if (!device_is_zero(bigger, common, std::max(sa, sb) - common))
+                throw MigrateError("verification FAILED: rounded-up tail of " +
+                                   what + " is not all zeros");
+        }
+        log("verified " + what + " (" + human(common) + " identical)");
     };
     if (mode == VerifyMode::All)
         for (const auto& snap : list_snapshots(orig_ds)) {
@@ -592,22 +685,78 @@ void verify(const std::string& new_ds, const std::string& orig_ds,
               << " byte-identical)." << std::endl;
 }
 
-void swap_names(const std::string& dest, const std::string& backup) {
-    std::string ro = zfs_get(g_opts.source, "readonly");
-    std::string snapdev = zfs_get(g_opts.source, "snapdev");
+// A property temporarily forced to a value on a dataset, restored on destruction
+// (best-effort).  Used to make the source's snapshot device nodes appear.
+class ScopedProp {
+   public:
+    ScopedProp(std::string ds, std::string prop, const std::string& value)
+        : ds_(std::move(ds)), prop_(std::move(prop)) {
+        saved_ = zfs_get(ds_, prop_);
+        if (saved_ != value)
+            sp::check_call({"zfs", "set", prop_ + "=" + value, ds_});
+        else
+            saved_.clear();  // already the desired value; nothing to restore
+    }
+    ~ScopedProp() { reset(); }
+    void reset() {
+        if (!saved_.empty()) {
+            sp::run_quiet({"zfs", "set", prop_ + "=" + saved_, ds_});
+            saved_.clear();
+        }
+    }
+    ScopedProp(const ScopedProp&) = delete;
+    ScopedProp& operator=(const ScopedProp&) = delete;
+
+   private:
+    std::string ds_, prop_, saved_;
+};
+
+void swap_names(const std::string& dest, const std::string& backup,
+                const std::string& orig_readonly, const std::string& orig_snapdev) {
     log("renaming " + g_opts.source + " -> " + backup + ", " + dest + " -> " +
         g_opts.source);
     run_mutate({"zfs", "rename", g_opts.source, backup});
-    run_mutate({"zfs", "rename", dest, g_opts.source});
-    run_mutate({"zfs", "set", "readonly=" + ro, g_opts.source});
-    run_mutate({"zfs", "set", "snapdev=" + snapdev, g_opts.source});
+    try {
+        run_mutate({"zfs", "rename", dest, g_opts.source});
+    } catch (...) {
+        // Undo the first rename so the volume doesn't vanish from its name.
+        if (!g_opts.dry_run &&
+            sp::run_quiet({"zfs", "rename", backup, g_opts.source}) != 0)
+            std::cerr << "error: rename of " << dest << " to " << g_opts.source
+                      << " failed AND the rollback failed; the original is now at "
+                      << backup << " and the new volume at " << dest
+                      << " -- rename them by hand.\n";
+        throw;
+    }
+    run_mutate({"zfs", "set", "readonly=" + orig_readonly, g_opts.source});
+    run_mutate({"zfs", "set", "snapdev=" + orig_snapdev, g_opts.source});
+}
+
+// A reservation/refreservation value from `zfs get -Hp` that means "set".
+bool prop_is_set(const std::string& v) {
+    return !v.empty() && v != "0" && v != "none" && v != "-";
 }
 
 void migrate() {
     uint64_t blocksize = parse_size(g_opts.volblocksize);
-    if (blocksize < 512u || (blocksize & (blocksize - 1)) != 0 ||
-        blocksize > 128u * 1024)
-        throw MigrateError("volblocksize must be a power of two in [512, 128K]");
+    if (blocksize < 512u || (blocksize & (blocksize - 1)) != 0)
+        throw MigrateError(
+            "volblocksize must be a power of two >= 512 (e.g. 8k, 32k, 128k)");
+
+    std::string pool = g_opts.source.substr(0, g_opts.source.find('/'));
+
+    // Blocks above 128K need the large_blocks pool feature; check for a clear
+    // message rather than letting `zfs create` fail cryptically after pre-flight.
+    if (blocksize > 128u * 1024) {
+        std::string feat = trim(sp::check_output(
+            {"zpool", "get", "-H", "-o", "value", "feature@large_blocks", pool}));
+        if (feat != "active" && feat != "enabled")
+            throw MigrateError(
+                "volblocksize " + g_opts.volblocksize +
+                " needs pool feature large_blocks (currently: " + feat +
+                "); enable it with `zpool set feature@large_blocks=enabled " + pool +
+                "`");
+    }
 
     if (zfs_get(g_opts.source, "type") != "volume")
         throw MigrateError(g_opts.source + " is not a zvol");
@@ -628,7 +777,7 @@ void migrate() {
     // snapshot -- nonzero means the head has diverged.
     std::string newest = snapshots.back().substr(snapshots.back().find('@') + 1);
     uint64_t since_newest =
-        std::stoull(zfs_get(g_opts.source, "written@" + newest));
+        to_u64(zfs_get(g_opts.source, "written@" + newest), "written@" + newest);
     if (since_newest > 0 && !g_opts.force)
         throw MigrateError(
             g_opts.source + ": " + human(since_newest) +
@@ -639,32 +788,98 @@ void migrate() {
 
     std::string dest = g_opts.dest.empty() ? g_opts.source + "-new" : g_opts.dest;
     std::string backup = g_opts.source + g_opts.backup_suffix;
+
+    // Pre-flight name checks: fail now, not after hours of copying.
+    auto exists = [](const std::string& ds) {
+        return sp::run_quiet({"zfs", "list", ds}) == 0;
+    };
+    if (exists(dest))
+        throw MigrateError(
+            dest + " already exists (leftover from a previous run? destroy it with "
+            "`zfs destroy -r " + dest + "`, or choose another --dest)");
+    if (!g_opts.no_swap && exists(backup))
+        throw MigrateError(backup +
+                           " already exists; destroy it or choose another "
+                           "--backup-suffix");
+
+    // Encryption: the new zvol inherits encryption from its parent, so migrating an
+    // encrypted source under a plaintext parent would silently produce PLAINTEXT.
+    std::string enc = zfs_get(g_opts.source, "encryption");
+    if (enc != "off") {
+        std::string dest_parent = dest.substr(0, dest.rfind('/'));
+        std::string parent_enc = zfs_get(dest_parent, "encryption");
+        if (parent_enc == "off" && !g_opts.allow_decrypt)
+            throw MigrateError(
+                g_opts.source + " is encrypted (" + enc + ") but the destination "
+                "parent " + dest_parent + " is not; the migrated copy would be "
+                "PLAINTEXT. Pass --allow-decrypt to accept this, or use --dest under "
+                "an encrypted parent.");
+        if (parent_enc != "off")
+            std::cerr << "warning: result will be encrypted under the parent's key ("
+                      << dest_parent << "), not the source's own key\n";
+    }
+
     std::vector<std::string> zstream_cmd = which_zstream();
     zstream_cmd.push_back("-v");
+
+    // Stash the source's original readonly/snapdev; snapdev is forced visible below
+    // (via the guard) so its snapshot device nodes exist for replay and verify.
+    std::string orig_readonly = zfs_get(g_opts.source, "readonly");
+    std::string orig_snapdev = zfs_get(g_opts.source, "snapdev");
+    bool src_thick = prop_is_set(zfs_get(g_opts.source, "refreservation"));
+    std::string src_reservation = zfs_get(g_opts.source, "reservation");
 
     log("migrating " + g_opts.source + " (" + std::to_string(snapshots.size()) +
         " snapshots) to volblocksize=" + std::to_string(blocksize) +
         ", dest=" + dest);
 
-    uint64_t first_volsize =
-        align_up(std::stoull(zfs_get(snapshots.front(), "volsize")), blocksize);
-    create_dest(dest, blocksize, first_volsize);
-    replay(dest, blocksize, snapshots, zstream_cmd);
+    std::optional<ScopedProp> snapdev_guard;
+    if (!g_opts.dry_run)
+        snapdev_guard.emplace(g_opts.source, "snapdev", "visible");
 
-    // Verify before swapping, so a mismatch leaves the original untouched.
-    if (g_opts.verify != VerifyMode::None && !g_opts.dry_run)
-        verify(dest, g_opts.source, g_opts.verify);
+    bool dest_created = false;
+    try {
+        uint64_t first_volsize = align_up(
+            to_u64(zfs_get(snapshots.front(), "volsize"), "volsize"), blocksize);
+        create_dest(dest, blocksize, first_volsize);
+        dest_created = true;
+        replay(dest, blocksize, snapshots, zstream_cmd);
 
-    if (g_opts.no_swap) {
-        std::cout << "Done. New zvol left at " << dest << " (no swap requested)."
-                  << std::endl;
-        return;
+        // Re-derive reservations the sparse create (-s) dropped, after the final
+        // volsize and before verify/swap -- so the thick guarantee is never missing
+        // from the volume under the original name, and if the pool lacks space the
+        // failure happens while the original is still intact.
+        if (src_thick) run_mutate({"zfs", "set", "refreservation=auto", dest});
+        if (prop_is_set(src_reservation))
+            run_mutate({"zfs", "set", "reservation=" + src_reservation, dest});
+
+        if (g_opts.verify != VerifyMode::None && !g_opts.dry_run)
+            verify(dest, g_opts.source, g_opts.verify);
+
+        if (g_opts.no_swap) {
+            std::cout << "Done. New zvol left at " << dest << " (no swap requested)."
+                      << std::endl;
+            return;
+        }
+
+        snapdev_guard.reset();  // restore source snapdev before it is renamed away
+        swap_names(dest, backup, orig_readonly, orig_snapdev);
+    } catch (...) {
+        if (dest_created && !g_opts.dry_run)
+            std::cerr << "note: an incomplete destination may be left at " << dest
+                      << "; remove it with: zfs destroy -r " << dest << "\n"
+                      << "the original " << g_opts.source << " was not modified.\n";
+        throw;
     }
-    swap_names(dest, backup);
+
     std::cout << "Done. " << g_opts.source
               << " now has volblocksize=" << blocksize << ". Original preserved as "
               << backup << "." << std::endl;
-    if (!g_opts.keep_backup && !g_opts.dry_run) {
+    if (orig_readonly == "on")
+        std::cout << "Note: " << g_opts.source
+                  << " is still readonly=on; run `zfs set readonly=off "
+                  << g_opts.source << "` when ready to use it.\n";
+    if (!g_opts.keep_backup) {
         log("destroying backup " + backup);
         sp::check_call({"zfs", "destroy", "-r", backup});
         std::cout << "Backup " << backup << " destroyed as requested." << std::endl;
@@ -680,6 +895,8 @@ const char* USAGE =
     "  --destroy-backup      destroy the original after a successful swap\n"
     "  --force               bypass precondition checks (readonly=on, and that the\n"
     "                        newest snapshot equals the live head)\n"
+    "  --allow-decrypt       allow an encrypted source to be written as plaintext\n"
+    "                        (when the destination parent is not encrypted)\n"
     "  --verify MODE         after copying, byte-compare against the original\n"
     "                        (MODE: head = the result only; all = every snapshot\n"
     "                        + head).  Runs before the swap; fails on any mismatch.\n"
@@ -709,6 +926,8 @@ bool parse_args(int argc, char** argv) {
             g_opts.keep_backup = false;
         } else if (a == "--force") {
             g_opts.force = true;
+        } else if (a == "--allow-decrypt") {
+            g_opts.allow_decrypt = true;
         } else if (a == "--verify") {
             std::string m = next();
             if (m == "all") g_opts.verify = VerifyMode::All;
@@ -737,6 +956,8 @@ bool parse_args(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::signal(SIGINT, on_sigint);
+    std::signal(SIGTERM, on_sigint);
     try {
         if (!parse_args(argc, argv)) return 0;
         migrate();

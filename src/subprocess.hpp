@@ -2,6 +2,7 @@
 // pipeline line by line without ever buffering the whole output.
 #pragma once
 
+#include <cstdint>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -29,11 +30,16 @@ int run_quiet(const std::vector<std::string>& args);
 
 // Spawn `producer | consumer` and invoke `on_line` for every line the consumer
 // writes to stdout.  Neither program's output is fully materialised.  Throws if
-// the consumer exits non-zero (the producer receiving SIGPIPE is tolerated); if
-// `on_line` throws, both children are killed and the exception is re-raised.
+// either child exits non-zero (reporting both when both fail; a producer killed
+// by SIGPIPE is tolerated); if `on_line` throws, both children are killed and the
+// exception is re-raised.
 void pipeline_for_each_line(
     const std::vector<std::string>& producer,
     const std::vector<std::string>& consumer,
     const std::function<void(const std::string&)>& on_line);
+
+// pread exactly `count` bytes at `offset` (looping over short reads, retrying
+// EINTR).  Returns false on any read error or EOF before `count` bytes.
+bool pread_full(int fd, void* buf, size_t count, uint64_t offset);
 
 }  // namespace sp

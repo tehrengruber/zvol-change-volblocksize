@@ -9,7 +9,11 @@ IMAGE="${IMAGE:-zvol-change-volblocksize-test}"
 
 podman build -t "$IMAGE" "$HERE"
 
-exec podman run --rm -it \
+# Only allocate a TTY when stdin is one, so CI / piped invocations don't break.
+TTY=()
+[ -t 0 ] && TTY=(-t)
+
+exec podman run --rm -i "${TTY[@]}" \
     --device /dev/kvm \
     -v "$REPO_DIR":/repo:ro,Z \
     -v zvol-change-volblocksize-cache:/cache \

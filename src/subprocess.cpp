@@ -12,6 +12,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -64,7 +65,15 @@ std::string check_output(const std::vector<std::string>& args) {
     std::string out;
     char buf[65536];
     ssize_t n;
-    while ((n = read(fds[0], buf, sizeof buf)) > 0) out.append(buf, n);
+    while ((n = read(fds[0], buf, sizeof buf)) != 0) {
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            close(fds[0]);
+            waitpid(pid, nullptr, 0);
+            throw CommandError("read error capturing output of: " + join(args));
+        }
+        out.append(buf, n);
+    }
     close(fds[0]);
     int status = 0;
     waitpid(pid, &status, 0);
@@ -89,6 +98,7 @@ void check_call(const std::vector<std::string>& args) {
 
 int run_quiet(const std::vector<std::string>& args) {
     int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (devnull < 0) throw CommandError("cannot open /dev/null");
     pid_t pid = spawn(args, -1, devnull, devnull);
     if (devnull >= 0) close(devnull);
     int status = 0;
@@ -142,15 +152,33 @@ void pipeline_for_each_line(
     waitpid(cons, &st_cons, 0);
     if (err) std::rethrow_exception(err);
 
+    // Report both when both fail: a broken producer (zfs send) usually makes the
+    // consumer (zstream) exit non-zero too, and the producer is the root cause.
+    std::string errs;
     if (exit_code(st_cons) != 0)
-        throw CommandError("consumer failed (rc=" +
-                           std::to_string(exit_code(st_cons)) + "): " +
-                           join(consumer));
+        errs = "consumer failed (rc=" + std::to_string(exit_code(st_cons)) +
+               "): " + join(consumer);
     // A producer killed by SIGPIPE is fine; only flag a real non-zero exit.
     if (WIFEXITED(st_prod) && WEXITSTATUS(st_prod) != 0)
-        throw CommandError("producer failed (rc=" +
-                           std::to_string(WEXITSTATUS(st_prod)) + "): " +
-                           join(producer));
+        errs += (errs.empty() ? "" : "; ") + std::string("producer failed (rc=") +
+                std::to_string(WEXITSTATUS(st_prod)) + "): " + join(producer);
+    if (!errs.empty()) throw CommandError(errs);
+}
+
+bool pread_full(int fd, void* buf, size_t count, uint64_t offset) {
+    char* p = static_cast<char*>(buf);
+    while (count > 0) {
+        ssize_t n = pread(fd, p, count, offset);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (n == 0) return false;  // unexpected EOF
+        p += n;
+        offset += static_cast<uint64_t>(n);
+        count -= static_cast<size_t>(n);
+    }
+    return true;
 }
 
 }  // namespace sp

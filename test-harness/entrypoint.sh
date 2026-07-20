@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Boot a disposable Ubuntu guest with ZFS and run the pytest suite inside it.
+# Boot a disposable Ubuntu guest with ZFS and run the CTest suite inside it.
 # Works both as a Podman container entrypoint and run directly on a host that
-# has qemu + xorriso + curl.  Exits with the guest's pytest exit code.
+# has qemu + xorriso + curl.  Exits with the guest's ctest exit code.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

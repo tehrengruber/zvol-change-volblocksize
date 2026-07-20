@@ -19,8 +19,9 @@ zvol, efficiently.
 2. Create a new sparse zvol with the requested `volblocksize`, carrying over
    **every explicitly-set (local/received) property** of the source at its
    *current* value — except the few we manage (`volsize`, `volblocksize`,
-   `readonly`, `snapdev`, reservations) or that are creation-time/key material
-   (encryption). Property *changes across the snapshot history are not replayed*;
+   `readonly`, `snapdev`, and reservations, which are re-derived after the copy)
+   or that are creation-time/key material (encryption). Property *changes across
+   the snapshot history are not replayed*;
    the new zvol is created once with the final property values and all its
    snapshots share them (this matches ZFS, where properties are live dataset
    attributes, not per-snapshot content). User properties are preserved.
@@ -69,6 +70,8 @@ cmake -S . -B build-static -DZCVB_STATIC=ON && cmake --build build-static
 
 ## Requirements & preconditions
 
+- **Linux only** (uses `/dev/zvol` device nodes, the `BLKDISCARD` ioctl and
+  `<linux/fs.h>`). It does not run on FreeBSD.
 - OpenZFS with `zfs`, `zpool`, and `zstream` (or the older `zstreamdump`).
 - **Run as root.**
 - The source zvol must be **`readonly=on`** (removes any race with a live writer
@@ -89,6 +92,9 @@ zfs set readonly=on pool/vol
 # migrate 8k -> 16k, keeping pool/vol-old as a backup
 sudo zvol-change-volblocksize pool/vol 16k
 
+# the tool preserves the source's readonly state, so re-enable writes when ready
+zfs set readonly=off pool/vol
+
 # inspect the result, then drop the backup when satisfied
 zfs destroy -r pool/vol-old
 ```
@@ -102,18 +108,32 @@ Options:
 | `--no-swap` | build the new zvol but don't rename anything |
 | `--verify MODE` | byte-compare the result against the original before swapping — `head` (the live head only) or `all` (every snapshot + head); aborts on any mismatch |
 | `--destroy-backup` | destroy the original after a successful swap (default: keep) |
-| `--force` | skip the `readonly=on` precondition check |
+| `--force` | skip the precondition checks (`readonly=on`, newest-snapshot-is-head) |
+| `--allow-decrypt` | allow an encrypted source to be written as plaintext (destination parent not encrypted) |
 | `--dry-run` | print the planned actions without changing anything |
 | `-v` | verbose progress on stderr |
 
 ## Limitations
 
-- Encrypted datasets require their keys loaded (data is read as plaintext from
-  the snapshot device); raw/`-w` sends are not used.
-- Assumes the newest snapshot equals the head (enforced by `readonly=on`).
+- **Encryption.** Data is read as plaintext from the snapshot device (keys must
+  be loaded); raw/`-w` sends are not used. The new zvol inherits encryption from
+  its **destination parent**, so the outcome is:
+
+  | source | destination parent | result |
+  | --- | --- | --- |
+  | encrypted | encrypted | encrypted **under the parent's key** (warning printed) |
+  | encrypted | not encrypted | refused unless `--allow-decrypt` → **plaintext** |
+  | not encrypted | either | not encrypted |
+
+- **Reservations.** The destination is created sparse; a thick source
+  (`refreservation`) has its reservation **re-derived** (`refreservation=auto`)
+  after the copy, and a plain `reservation` is copied by value — both applied
+  before verify/swap, so the guarantee is never missing under the original name.
+- Assumes the newest snapshot equals the head (checked via `written@<newest>`).
 - `volsize` must be a multiple of the new `volblocksize`; if the source size
   isn't, the new volume is rounded up to the next block (the extra tail reads as
-  zeros).
+  zeros, which `--verify` confirms).
+- Blocks larger than 128K require the pool's `large_blocks` feature.
 
 ## Testing
 

@@ -43,6 +43,12 @@ bool dataset_exists(const std::string& dataset) {
 }
 
 std::string dev_path(const std::string& dataset) {
+    // Snapshot device nodes only appear when snapdev=visible on the parent zvol.
+    // The tool restores the source's original snapdev after migrating, so tests
+    // must (re-)enable visibility on whatever dataset they want to inspect.
+    auto at = dataset.find('@');
+    if (at != std::string::npos)
+        sp::run_quiet({"zfs", "set", "snapdev=visible", dataset.substr(0, at)});
     std::string path = "/dev/zvol/" + dataset;
     sp::run_quiet({"udevadm", "settle"});
     for (int i = 0; i < 150; ++i) {
@@ -77,9 +83,10 @@ std::vector<std::string> snapshot_names(const std::string& dataset) {
 
 std::string make_zvol(const std::string& volblocksize, const std::string& size,
                       const std::string& name) {
+    // Deliberately do NOT set snapdev here, so the default-hidden path (which the
+    // tool must handle by toggling it itself) is what's exercised.
     std::string dataset = testing::g_pool + "/" + name;
-    zfs({"create", "-V", size, "-b", volblocksize, "-o", "snapdev=visible",
-         dataset});
+    zfs({"create", "-V", size, "-b", volblocksize, dataset});
     return dataset;
 }
 
@@ -89,17 +96,7 @@ static int open_dev(const std::string& dataset, int flags) {
     return fd;
 }
 
-static bool pread_full(int fd, void* buf, size_t count, uint64_t offset) {
-    char* p = static_cast<char*>(buf);
-    while (count > 0) {
-        ssize_t n = pread(fd, p, count, offset);
-        if (n <= 0) return false;
-        p += n;
-        offset += n;
-        count -= n;
-    }
-    return true;
-}
+using sp::pread_full;
 
 void write_pattern(const std::string& dataset, uint64_t offset, uint64_t size,
                    uint64_t seed) {

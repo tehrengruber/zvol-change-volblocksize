@@ -5,7 +5,10 @@ add_executable(zvol_tests
   test_volsize.cpp
   test_holes.cpp
   test_properties.cpp
-  test_head.cpp)
+  test_head.cpp
+  test_snapdev.cpp
+  test_reservation.cpp
+  test_encryption.cpp)
 target_link_libraries(zvol_tests PRIVATE zcvb_common)
 
 # Each test is its own process (creates a throwaway pool on a loop file); it
@@ -14,8 +17,10 @@ target_link_libraries(zvol_tests PRIVATE zcvb_common)
 set(cvb_tests
   content_larger content_smaller single_snapshot no_swap
   verify_all verify_detects_mismatch
-  holes volsize_increases volsize_decreases properties
-  head_is_newest_snapshot rejects_divergent_head)
+  holes volsize_increases volsize_decreases volsize_shrink_then_grow
+  volsize_unaligned properties
+  head_is_newest_snapshot rejects_divergent_head
+  snapdev_hidden_restored reservation_preserved refuses_silent_decrypt)
 foreach(t IN LISTS cvb_tests)
   add_test(NAME ${t}
            COMMAND zvol_tests ${t} $<TARGET_FILE:zvol-change-volblocksize>)
