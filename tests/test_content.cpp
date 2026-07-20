@@ -58,6 +58,32 @@ TEST(single_snapshot) {
     assert_migrated_equal(source, source + "-old", 64u * 1024);
 }
 
+TEST(verify_all) {
+    auto source = make_zvol("8k", "64M");
+    build_history(source);
+    zfs({"set", "readonly=on", source});
+    // The built-in verifier byte-compares every snapshot + head before swapping;
+    // exit 0 means it passed. Then confirm externally too.
+    EXPECT_EQ(migrate(source, "32k", {"--verify", "all"}), 0);
+    assert_migrated_equal(source, source + "-old", 32u * 1024);
+}
+
+TEST(verify_detects_mismatch) {
+    // Make the live head diverge from the newest snapshot by writing after it.
+    // The tool only reproduces up to the newest snapshot, so the migrated head
+    // will differ from the original head -- exactly what --verify must catch.
+    auto source = make_zvol("8k", "32M");
+    write_pattern(source, 0, 8 * MiB, 1);
+    snapshot(source, "s0");
+    write_pattern(source, 8 * MiB, 8 * MiB, 2);  // head now differs from s0
+    zfs({"set", "readonly=on", source});
+
+    // Verification must fail (non-zero exit); and since it runs before the swap,
+    // the original is left untouched (no <source>-old backup was created).
+    EXPECT_NE(migrate(source, "16k", {"--verify", "head"}), 0);
+    EXPECT_TRUE(!dataset_exists(source + "-old"));
+}
+
 TEST(no_swap) {
     auto source = make_zvol("8k", "16M");
     write_pattern(source, 0, 4 * MiB, 20);

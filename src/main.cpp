@@ -22,6 +22,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <functional>
 #include <iostream>
@@ -164,6 +165,11 @@ enum class Op { None, Write, Free };
 struct Change {
     Op op = Op::None;
     uint64_t offset = 0;
+    // Length is signed only because of one case: a FREE can carry length == -1,
+    // ZFS's DMU_OBJECT_END sentinel (UINT64_MAX, printed as -1 by zstream) meaning
+    // "free from offset to the end of the volume" -- e.g. the trailing free of a
+    // full send or the truncated tail of a volsize shrink.  RangeApplier::free()
+    // normalizes it to volsize - offset.  WRITE lengths are always positive.
     int64_t length = 0;
 };
 
@@ -375,6 +381,9 @@ class RangeApplier {
 
 // ---- migration ----------------------------------------------------------- //
 
+// What to byte-compare between the migrated zvol and the original after copying.
+enum class VerifyMode { None, Head, All };
+
 struct Options {
     std::string source;
     std::string volblocksize;
@@ -385,6 +394,7 @@ struct Options {
     bool force = false;
     bool dry_run = false;
     bool verbose = false;
+    VerifyMode verify = VerifyMode::None;
 };
 
 Options g_opts;
@@ -524,6 +534,64 @@ void replay(const std::string& dest, uint64_t blocksize,
     }
 }
 
+// ---- verification -------------------------------------------------------- //
+
+uint64_t volsize_of(const std::string& dataset) {
+    return std::stoull(zfs_get(dataset, "volsize"));
+}
+
+bool devices_identical(const std::string& dev_a, const std::string& dev_b,
+                       uint64_t size) {
+    int fa = open(dev_a.c_str(), O_RDONLY);
+    int fb = open(dev_b.c_str(), O_RDONLY);
+    if (fa < 0 || fb < 0) {
+        if (fa >= 0) close(fa);
+        if (fb >= 0) close(fb);
+        throw MigrateError("cannot open devices to verify: " + dev_a + ", " + dev_b);
+    }
+    std::vector<char> ba(CHUNK), bb(CHUNK);
+    bool equal = true;
+    for (uint64_t pos = 0; pos < size && equal;) {
+        size_t n = std::min<uint64_t>(CHUNK, size - pos);
+        if (pread(fa, ba.data(), n, pos) != static_cast<ssize_t>(n) ||
+            pread(fb, bb.data(), n, pos) != static_cast<ssize_t>(n)) {
+            equal = false;
+            break;
+        }
+        if (std::memcmp(ba.data(), bb.data(), n) != 0) equal = false;
+        pos += n;
+    }
+    close(fa);
+    close(fb);
+    return equal;
+}
+
+// Byte-compare the migrated volume against the original.  With All, every snapshot
+// is compared; the live head (the result) is always compared.  Runs before the
+// swap so a failure leaves the original untouched.
+void verify(const std::string& new_ds, const std::string& orig_ds,
+            VerifyMode mode) {
+    auto check = [&](const std::string& a, const std::string& b,
+                     const std::string& what) {
+        uint64_t size = std::min(volsize_of(a), volsize_of(b));
+        std::string da = wait_for_device("/dev/zvol/" + a);
+        std::string db = wait_for_device("/dev/zvol/" + b);
+        if (!devices_identical(da, db, size))
+            throw MigrateError("verification FAILED: " + what +
+                               " is not byte-identical to the original");
+        log("verified " + what + " (" + human(size) + " identical)");
+    };
+    if (mode == VerifyMode::All)
+        for (const auto& snap : list_snapshots(orig_ds)) {
+            std::string sh = snap.substr(snap.find('@') + 1);
+            check(new_ds + "@" + sh, orig_ds + "@" + sh, "snapshot " + sh);
+        }
+    check(new_ds, orig_ds, "head");
+    std::cout << "Verification passed ("
+              << (mode == VerifyMode::All ? "all snapshots + head" : "head")
+              << " byte-identical)." << std::endl;
+}
+
 void swap_names(const std::string& dest, const std::string& backup) {
     std::string ro = zfs_get(g_opts.source, "readonly");
     std::string snapdev = zfs_get(g_opts.source, "snapdev");
@@ -567,6 +635,10 @@ void migrate() {
     create_dest(dest, blocksize, first_volsize);
     replay(dest, blocksize, snapshots, zstream_cmd);
 
+    // Verify before swapping, so a mismatch leaves the original untouched.
+    if (g_opts.verify != VerifyMode::None && !g_opts.dry_run)
+        verify(dest, g_opts.source, g_opts.verify);
+
     if (g_opts.no_swap) {
         std::cout << "Done. New zvol left at " << dest << " (no swap requested)."
                   << std::endl;
@@ -591,6 +663,9 @@ const char* USAGE =
     "  --keep-backup         keep the original as backup (default)\n"
     "  --destroy-backup      destroy the original after a successful swap\n"
     "  --force               bypass the readonly=on precondition check\n"
+    "  --verify MODE         after copying, byte-compare against the original\n"
+    "                        (MODE: head = the result only; all = every snapshot\n"
+    "                        + head).  Runs before the swap; fails on any mismatch.\n"
     "  --dry-run             print planned actions without changing anything\n"
     "  -v, --verbose\n";
 
@@ -617,6 +692,12 @@ bool parse_args(int argc, char** argv) {
             g_opts.keep_backup = false;
         } else if (a == "--force") {
             g_opts.force = true;
+        } else if (a == "--verify") {
+            std::string m = next();
+            if (m == "all") g_opts.verify = VerifyMode::All;
+            else if (m == "head") g_opts.verify = VerifyMode::Head;
+            else if (m == "none") g_opts.verify = VerifyMode::None;
+            else throw MigrateError("--verify expects: none | head | all");
         } else if (a == "--dry-run") {
             g_opts.dry_run = true;
         } else if (a == "-v" || a == "--verbose") {

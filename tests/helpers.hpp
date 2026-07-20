@@ -12,6 +12,7 @@ void zfs(const std::vector<std::string>& args);
 
 std::string get_prop(const std::string& dataset, const std::string& prop);
 uint64_t volsize(const std::string& dataset);
+bool dataset_exists(const std::string& dataset);
 
 // Path to a zvol/snapshot device, waited for until it exists.
 std::string dev_path(const std::string& dataset);

@@ -38,6 +38,10 @@ uint64_t volsize(const std::string& dataset) {
     return std::stoull(get_prop(dataset, "volsize"));
 }
 
+bool dataset_exists(const std::string& dataset) {
+    return sp::run_quiet({"zfs", "list", dataset}) == 0;
+}
+
 std::string dev_path(const std::string& dataset) {
     std::string path = "/dev/zvol/" + dataset;
     sp::run_quiet({"udevadm", "settle"});

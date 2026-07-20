@@ -97,6 +97,7 @@ Options:
 | `--dest NAME` | intermediate name for the new zvol (default `<source>-new`) |
 | `--backup-suffix S` | suffix for the preserved original (default `-old`) |
 | `--no-swap` | build the new zvol but don't rename anything |
+| `--verify MODE` | byte-compare the result against the original before swapping — `head` (the live head only) or `all` (every snapshot + head); aborts on any mismatch |
 | `--destroy-backup` | destroy the original after a successful swap (default: keep) |
 | `--force` | skip the `readonly=on` precondition check |
 | `--dry-run` | print the planned actions without changing anything |
