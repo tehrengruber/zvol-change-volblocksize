@@ -78,9 +78,11 @@ TEST(verify_detects_mismatch) {
     write_pattern(source, 8 * MiB, 8 * MiB, 2);  // head now differs from s0
     zfs({"set", "readonly=on", source});
 
-    // Verification must fail (non-zero exit); and since it runs before the swap,
-    // the original is left untouched (no <source>-old backup was created).
-    EXPECT_NE(migrate(source, "16k", {"--verify", "head"}), 0);
+    // --force gets past the divergent-head precondition so we exercise --verify
+    // itself: it compares the migrated head to the (divergent) original head, must
+    // fail (non-zero exit), and since it runs before the swap the original is left
+    // untouched (no <source>-old backup was created).
+    EXPECT_NE(migrate(source, "16k", {"--force", "--verify", "head"}), 0);
     EXPECT_TRUE(!dataset_exists(source + "-old"));
 }
 

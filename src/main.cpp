@@ -621,6 +621,22 @@ void migrate() {
         throw MigrateError(g_opts.source +
                            " has no snapshots; nothing to retain");
 
+    // The newest snapshot must equal the live head, otherwise migrating would
+    // silently drop everything written since it.  readonly=on prevents new writes
+    // going forward but does not guarantee the head was in sync when it was set,
+    // so check directly: written@<newest> is the space written since the newest
+    // snapshot -- nonzero means the head has diverged.
+    std::string newest = snapshots.back().substr(snapshots.back().find('@') + 1);
+    uint64_t since_newest =
+        std::stoull(zfs_get(g_opts.source, "written@" + newest));
+    if (since_newest > 0 && !g_opts.force)
+        throw MigrateError(
+            g_opts.source + ": " + human(since_newest) +
+            " written since the newest snapshot @" + newest +
+            " -- the live head is not captured in a snapshot. Snapshot it first, or "
+            "pass --force to migrate only up to @" + newest +
+            " (dropping later writes).");
+
     std::string dest = g_opts.dest.empty() ? g_opts.source + "-new" : g_opts.dest;
     std::string backup = g_opts.source + g_opts.backup_suffix;
     std::vector<std::string> zstream_cmd = which_zstream();
@@ -662,7 +678,8 @@ const char* USAGE =
     "  --no-swap             leave the result under --dest; do not rename\n"
     "  --keep-backup         keep the original as backup (default)\n"
     "  --destroy-backup      destroy the original after a successful swap\n"
-    "  --force               bypass the readonly=on precondition check\n"
+    "  --force               bypass precondition checks (readonly=on, and that the\n"
+    "                        newest snapshot equals the live head)\n"
     "  --verify MODE         after copying, byte-compare against the original\n"
     "                        (MODE: head = the result only; all = every snapshot\n"
     "                        + head).  Runs before the swap; fails on any mismatch.\n"

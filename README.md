@@ -71,9 +71,12 @@ cmake -S . -B build-static -DZCVB_STATIC=ON && cmake --build build-static
 
 - OpenZFS with `zfs`, `zpool`, and `zstream` (or the older `zstreamdump`).
 - **Run as root.**
-- The source zvol must be **`readonly=on`** so that its newest snapshot equals
-  the live head (this removes any race with a live writer). Set it before
-  running, or pass `--force` to skip the check.
+- The source zvol must be **`readonly=on`** (removes any race with a live writer
+  during the migration). Set it before running, or pass `--force` to skip.
+- The **newest snapshot must equal the live head** — i.e. nothing has been written
+  since the newest snapshot (`written@<newest>` is 0). Otherwise the tool refuses,
+  because it would silently drop those post-snapshot writes; snapshot the head
+  first, or pass `--force` to migrate only up to the newest snapshot.
 - The source must have at least one snapshot.
 
 ## Usage

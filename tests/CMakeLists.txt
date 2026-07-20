@@ -15,7 +15,7 @@ set(cvb_tests
   content_larger content_smaller single_snapshot no_swap
   verify_all verify_detects_mismatch
   holes volsize_increases volsize_decreases properties
-  head_is_newest_snapshot)
+  head_is_newest_snapshot rejects_divergent_head)
 foreach(t IN LISTS cvb_tests)
   add_test(NAME ${t}
            COMMAND zvol_tests ${t} $<TARGET_FILE:zvol-change-volblocksize>)
