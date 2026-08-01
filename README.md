@@ -111,7 +111,7 @@ Options:
 | `--backup-suffix S` | suffix for the preserved original (default `-old`) |
 | `--no-swap` | build the new zvol but don't rename anything |
 | `--resume-from SNAP` | continue an interrupted run: replay from source snapshot `SNAP` onto an existing `--dest` that already holds the earlier snapshots |
-| `--verify MODE` | byte-compare the result against the original before swapping — `head` (the live head only) or `all` (every snapshot + head); aborts on any mismatch |
+| `--verify MODE` | byte-compare the result against the original before swapping — `head` (the live head only), `all` (every snapshot + head), or `@<snapshot>` (only that one snapshot); aborts on any mismatch |
 | `--verify-only` | only compare an existing `--dest` against the source (no transfer); uses `--verify MODE` (default `all`). Handy to re-check a `--no-swap` result |
 | `--destroy-backup` | destroy the original after a successful swap (default: keep) |
 | `--force` | skip the precondition checks (`readonly=on`, newest-snapshot-is-head) |

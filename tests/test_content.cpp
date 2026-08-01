@@ -68,6 +68,25 @@ TEST(verify_all) {
     assert_migrated_equal(source, source + "-old", 32u * 1024);
 }
 
+TEST(verify_one) {
+    // --verify @<snapshot> compares only that one snapshot (not the head).
+    auto source = make_zvol("8k", "64M");
+    build_history(source);
+    zfs({"set", "readonly=on", source});
+
+    EXPECT_EQ(migrate(source, "32k",
+                      {"--no-swap", "--dest", source + "-n1", "--verify", "@s1"}),
+              0);
+    // A snapshot that doesn't exist on the source is rejected (non-zero exit).
+    EXPECT_NE(migrate(source, "32k",
+                      {"--no-swap", "--dest", source + "-n2", "--verify", "@nope"}),
+              0);
+    // A bare (non-@) name is not a valid --verify argument.
+    EXPECT_NE(migrate(source, "32k",
+                      {"--no-swap", "--dest", source + "-n3", "--verify", "s1"}),
+              0);
+}
+
 TEST(verify_detects_mismatch) {
     // Make the live head diverge from the newest snapshot by writing after it.
     // The tool only reproduces up to the newest snapshot, so the migrated head

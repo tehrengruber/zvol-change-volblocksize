@@ -297,19 +297,15 @@ std::string human_time(double seconds) {
 
 // A one-line progress display on stderr showing percentage, bytes, transfer speed
 // (over the last ~10 seconds) and ETA.  Drawn only when stderr is a terminal (so
-// scripts/logs stay clean) and redrawn at most once per ~10 MB of progress,
-// expressed as a whole number of destination blocks.  `total` is an estimate
-// (0 = unknown -> no % / ETA).
+// scripts/logs stay clean) and redrawn at most once per second so the rate stays
+// readable.  `total` is an estimate (0 = unknown -> no % / ETA).
 class Progress {
    public:
-    Progress(std::string label, uint64_t total, uint64_t blocksize)
+    Progress(std::string label, uint64_t total)
         : label_(std::move(label)),
           total_(total),
           tty_(isatty(STDERR_FILENO)),
-          start_(std::chrono::steady_clock::now()) {
-        uint64_t blocks = std::max<uint64_t>(1, (10ull * 1024 * 1024) / blocksize);
-        redraw_bytes_ = blocks * blocksize;  // ~10 MB, rounded to a block boundary
-    }
+          start_(std::chrono::steady_clock::now()) {}
     ~Progress() {
         // If we're being torn down without finish() (e.g. an exception aborted the
         // work), wipe the half-drawn bar line so the error prints on a clean line.
@@ -326,9 +322,12 @@ class Progress {
                now - window_.front().first > std::chrono::seconds(10))
             window_.pop_front();
 
-        if (drawn_ && done < total_ && done - last_drawn_ < redraw_bytes_) return;
+        // Repaint at most once per second so the transfer rate stays readable
+        // (and doesn't flicker on a fast device), unless we've reached the end.
+        if (drawn_ && done < total_ && now - last_draw_time_ < std::chrono::seconds(1))
+            return;
         drawn_ = true;
-        last_drawn_ = done;
+        last_draw_time_ = now;
 
         double wsecs =
             std::chrono::duration<double>(now - window_.front().first).count();
@@ -374,8 +373,7 @@ class Progress {
     uint64_t total_;
     bool tty_;
     std::chrono::steady_clock::time_point start_;
-    uint64_t redraw_bytes_ = 0;
-    uint64_t last_drawn_ = 0;
+    std::chrono::steady_clock::time_point last_draw_time_{};
     bool drawn_ = false;
     bool finished_ = false;
     // (timestamp, cumulative bytes) samples within the trailing ~10s window.
@@ -491,7 +489,7 @@ class RangeApplier {
 // ---- migration ----------------------------------------------------------- //
 
 // What to byte-compare between the migrated zvol and the original after copying.
-enum class VerifyMode { None, Head, All };
+enum class VerifyMode { None, Head, All, One };
 
 struct Options {
     std::string source;
@@ -506,6 +504,7 @@ struct Options {
     bool dry_run = false;
     bool verbose = false;
     VerifyMode verify = VerifyMode::None;
+    std::optional<std::string> verify_snap;  // set iff verify == One (short name)
     bool verify_only = false;  // just compare an existing dest; no transfer
 };
 
@@ -629,8 +628,7 @@ void replay(const std::string& dest, uint64_t blocksize,
         estimates[i] = estimate_change(send_command(snapshots, i));
         total += estimates[i];
     }
-    Progress progress(std::to_string(snapshots.size() - start) + " snapshots", total,
-                      blocksize);
+    Progress progress(std::to_string(snapshots.size() - start) + " snapshots", total);
     uint64_t done = 0;  // bytes written so far across all replayed snapshots
     // Verbose lines are routed through the bar so they don't collide with it.
     auto vlog = [&](const std::string& m) {
@@ -776,10 +774,10 @@ bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size,
     return zero;
 }
 
-// Byte-compare the migrated volume against the original.  With All, every snapshot
-// is compared; the live head (the result) is always compared.  Shows one progress
-// bar across all comparisons.  Runs before the swap so a failure leaves the
-// original untouched.
+// Byte-compare the migrated volume against the original.  All compares every
+// snapshot plus the live head; Head compares only the head; One compares only the
+// single named snapshot (verify_snap).  Shows one progress bar across all
+// comparisons.  Runs before the swap so a failure leaves the original untouched.
 void verify(const std::string& new_ds, const std::string& orig_ds,
             VerifyMode mode) {
     struct Item {
@@ -796,12 +794,22 @@ void verify(const std::string& new_ds, const std::string& orig_ds,
             std::string sh = snap.substr(snap.find('@') + 1);
             add(new_ds + "@" + sh, orig_ds + "@" + sh, "snapshot " + sh);
         }
-    add(new_ds, orig_ds, "head");
+    if (mode == VerifyMode::One) {
+        const std::string& sh = g_opts.verify_snap.value();
+        if (sp::run_quiet({"zfs", "list", orig_ds + "@" + sh}) != 0)
+            throw MigrateError("--verify " + sh + ": " + orig_ds + "@" + sh +
+                               " is not a snapshot of the source");
+        if (sp::run_quiet({"zfs", "list", new_ds + "@" + sh}) != 0)
+            throw MigrateError("--verify " + sh + ": " + new_ds + "@" + sh +
+                               " is missing on the target");
+        add(new_ds + "@" + sh, orig_ds + "@" + sh, "snapshot " + sh);
+    } else {
+        add(new_ds, orig_ds, "head");
+    }
 
     uint64_t total = 0;
     for (const auto& it : items) total += std::max(it.sa, it.sb);
-    Progress progress("verifying " + std::to_string(items.size()) + " items", total,
-                      1024 * 1024);
+    Progress progress("verifying " + std::to_string(items.size()) + " items", total);
     uint64_t done = 0;
 
     for (const auto& it : items) {
@@ -829,9 +837,12 @@ void verify(const std::string& new_ds, const std::string& orig_ds,
                              human(common) + " identical)");
     }
     progress.finish(done);
-    std::cout << "Verification passed ("
-              << (mode == VerifyMode::All ? "all snapshots + head" : "head")
-              << " byte-identical)." << std::endl;
+    std::string what = mode == VerifyMode::All ? "all snapshots + head"
+                       : mode == VerifyMode::One
+                           ? "snapshot " + g_opts.verify_snap.value()
+                           : "head";
+    std::cout << "Verification passed (" << what << " byte-identical)."
+              << std::endl;
 }
 
 // A property temporarily forced to a value on a dataset, restored on destruction
@@ -1122,7 +1133,8 @@ const char* USAGE =
     "                        (when the destination parent is not encrypted)\n"
     "  --verify MODE         after copying, byte-compare against the original\n"
     "                        (MODE: head = the result only; all = every snapshot\n"
-    "                        + head).  Runs before the swap; fails on any mismatch.\n"
+    "                        + head; @<snapshot> = only that one snapshot).  Runs\n"
+    "                        before the swap; fails on any mismatch.\n"
     "  --verify-only         only byte-compare an existing --dest against the\n"
     "                        source (no transfer); uses --verify MODE, default all\n"
     "  --dry-run             print planned actions without changing anything\n"
@@ -1160,7 +1172,19 @@ bool parse_args(int argc, char** argv) {
             if (m == "all") g_opts.verify = VerifyMode::All;
             else if (m == "head") g_opts.verify = VerifyMode::Head;
             else if (m == "none") g_opts.verify = VerifyMode::None;
-            else throw MigrateError("--verify expects: none | head | all");
+            else if (m.find('@') != std::string::npos) {
+                // A single snapshot to compare on its own; must be @-qualified
+                // ("vol@snap" or "@snap") so it can't be confused with a mode.
+                std::string sh = m.substr(m.find('@') + 1);
+                if (sh.empty())
+                    throw MigrateError(
+                        "--verify expects: none | head | all | @<snapshot>");
+                g_opts.verify = VerifyMode::One;
+                g_opts.verify_snap = sh;
+            } else {
+                throw MigrateError(
+                    "--verify expects: none | head | all | @<snapshot>");
+            }
         } else if (a == "--verify-only") {
             g_opts.verify_only = true;
         } else if (a == "--dry-run") {

@@ -19,7 +19,7 @@ target_link_libraries(zvol_tests PRIVATE zcvb_common)
 # concurrent pools from contending.
 set(cvb_tests
   content_larger content_smaller single_snapshot no_swap
-  verify_all verify_detects_mismatch
+  verify_all verify_one verify_detects_mismatch
   holes volsize_increases volsize_decreases volsize_shrink_then_grow
   volsize_unaligned properties
   head_is_newest_snapshot rejects_divergent_head
