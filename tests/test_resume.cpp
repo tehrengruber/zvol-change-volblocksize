@@ -31,7 +31,8 @@ TEST(resume_from) {
     zfs({"set", "readonly=on", source});
 
     // Resume: replay s2 onto the existing dest (which already has s0, s1).
-    EXPECT_EQ(migrate(source, "16k", {"--no-swap", "--resume-from", "s2"}), 0);
+    // Use the @-qualified form to exercise snapshot-name normalization.
+    EXPECT_EQ(migrate(source, "16k", {"--no-swap", "--resume-from", "@s2"}), 0);
     EXPECT_TRUE(snapshot_names(dest) ==
                 (std::vector<std::string>{"s0", "s1", "s2"}));
 

@@ -986,10 +986,12 @@ void migrate() {
     size_t start = 0;
     bool resuming = !g_opts.resume_from.empty();
     if (resuming) {
+        // Accept "pool/vol@snap", "@snap" or a bare short name (short_of
+        // normalizes all three to the short name).
+        std::string want = short_of(g_opts.resume_from);
         size_t r = snapshots.size();
         for (size_t i = 0; i < snapshots.size(); ++i)
-            if (snapshots[i] == g_opts.resume_from ||
-                short_of(snapshots[i]) == g_opts.resume_from) {
+            if (short_of(snapshots[i]) == want) {
                 r = i;
                 break;
             }
