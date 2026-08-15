@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(zvol-change-volblocksize VERSION 0.0.2 LANGUAGES CXX)
+project(zvol-change-volblocksize VERSION 0.0.3 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -9,7 +9,8 @@ endif()
 add_compile_options(-Wall -Wextra)
 
 # Shared POSIX process helpers, used by the tool and the tests.
-add_library(zcvb_common STATIC src/subprocess.cpp)
+add_library(zcvb_common STATIC src/subprocess.cpp src/sha256.cpp src/guidstream.cpp
+            src/lthash.cpp)
 target_include_directories(zcvb_common PUBLIC src)
 
 add_executable(zvol-change-volblocksize src/main.cpp)

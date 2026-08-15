@@ -113,11 +113,97 @@ Options:
 | `--resume-from SNAP` | continue an interrupted run: replay from source snapshot `SNAP` onto an existing `--dest` that already holds the earlier snapshots |
 | `--verify MODE` | byte-compare the result against the original before swapping — `head` (the live head only), `all` (every snapshot + head), or `@<snapshot>` (only that one snapshot); aborts on any mismatch |
 | `--verify-only` | only compare an existing `--dest` against the source (no transfer); uses `--verify MODE` (default `all`). Handy to re-check a `--no-swap` result |
+| `--align-guids` | **(experimental)** forge deterministic GUIDs (derived from the source snapshot GUIDs) on the migrated snapshots — see [GUID alignment](#guid-alignment-experimental) |
+| `--align-guids-to FILE` | **(experimental)** forge the GUIDs recorded in a fingerprint `FILE` (made by `--fingerprint-only`), but only after each snapshot's replayed content matches that file's fingerprint |
+| `--fingerprint-only` | just write a fingerprint of `<source>`'s snapshots and exit (no conversion); writes to `--fingerprint-out` |
+| `--fingerprint-out F` | where `--fingerprint-only` writes (default stdout `-`); not valid with the align modes |
+| `--verify-fingerprint F` | recompute `<source>`'s snapshot fingerprints and compare them to `FILE` (no conversion); non-zero exit on mismatch |
 | `--destroy-backup` | destroy the original after a successful swap (default: keep) |
 | `--force` | skip the precondition checks (`readonly=on`, newest-snapshot-is-head) |
 | `--allow-decrypt` | allow an encrypted source to be written as plaintext (destination parent not encrypted) |
 | `--dry-run` | print the planned actions without changing anything |
 | `-v` | verbose progress on stderr |
+
+## GUID alignment (experimental)
+
+> **Experimental and not thoroughly tested. Use at your own risk, and always with
+> `--verify all`.** It forges snapshot identity; if the two sides ever diverge it
+> can make replication misbehave rather than fail loudly.
+
+### The problem
+
+If you keep a dataset on two pools kept in sync with `zfs send | recv`, and you
+reblock **each pool independently** with this tool, the two results are **no
+longer replication-compatible** — even though their data is identical. ZFS matches
+snapshots for incremental `send -i` by **GUID**, a random 64-bit id assigned when a
+snapshot is created; two independent reblocks mint different GUIDs, so ZFS sees no
+common base. (Normally you'd reblock one side and re-`send -R` the whole thing to
+the other, but that transfers all the data again.)
+
+### What alignment does
+
+After replaying each snapshot, `--align-guids` **forges** its GUID via a data-less
+`zfs recv` (the snapshot's content comes from a temporary base snapshot; only the
+chosen GUID rides in a tiny rewritten stream). The forged GUID is derived
+deterministically from the **source snapshot's own GUID**. This works because the
+two pools are replicas of the same dataset — replication propagates GUIDs, so the
+same source snapshot has the *same* GUID on both pools, and both therefore derive
+the *same* forged GUID with no coordination. Deriving from the source GUID (rather
+than from the content) also keeps the forged GUIDs **unique**: two snapshots with
+identical content — e.g. two consecutive no-change snapshots — still have distinct
+source GUIDs and so get distinct forged GUIDs.
+
+`--align-guids` writes **no file** — the forged GUIDs come entirely from the source
+GUIDs. A **fingerprint file** (for the "to a reference" mode below) is produced
+separately by `--fingerprint-only`: one line per snapshot with its logical-content
+fingerprint, volsize, and GUID.
+
+### Two ways to align
+
+- **Symmetric** — run `--align-guids` on both pools. This relies on the two pools
+  sharing source-snapshot GUIDs (i.e. they really are `send`/`recv` replicas of one
+  dataset). Same source GUIDs → same forged GUIDs.
+- **To a reference** — the general case, and the only correct one if the two sides'
+  source GUIDs *don't* match (e.g. the datasets were built independently but hold
+  the same data). Record a reference fingerprint of the source with
+  `--fingerprint-only`, copy it to both pools, and reblock each with
+  `--align-guids-to <file>`. Each forges exactly the GUIDs in the file, **but only
+  after** each snapshot's replayed content matches the fingerprint (and volsize)
+  recorded there — so a content divergence aborts the run rather than producing a
+  false match. This content check is what makes alignment safe; it happens per
+  snapshot, *before* that snapshot's GUID is forged.
+
+```console
+# record a reference fingerprint of the source's snapshots
+sudo zvol-change-volblocksize poolA/vol --fingerprint-only --fingerprint-out vol.fingerprint
+# ... copy vol.fingerprint to pool B ...
+# reblock each pool, aligning to the reference
+sudo zvol-change-volblocksize poolA/vol 16k --align-guids-to vol.fingerprint --verify all
+sudo zvol-change-volblocksize poolB/vol 16k --align-guids-to vol.fingerprint --verify all
+```
+
+### Fingerprints as a standalone check
+
+Both fingerprint operations work without any conversion:
+
+```console
+# record the fingerprint of an existing dataset's snapshots
+sudo zvol-change-volblocksize poolA/vol --fingerprint-only --fingerprint-out vol.fingerprint
+# later, confirm another dataset's snapshots still match it
+sudo zvol-change-volblocksize poolB/vol --verify-fingerprint vol.fingerprint
+```
+
+The fingerprint is an **LtHash** — an incremental homomorphic multiset hash — over
+cells the size of the zvol's `volblocksize`. Because it is just modular vector
+addition, a snapshot's fingerprint updates from the previous one in time proportional
+to the bytes that changed: each later snapshot only re-hashes the cells the
+`zfs send -i` change stream reports (never re-reading holes), so a whole scan is
+O(total changes) rather than O(volsize × snapshots). Each row stores the full
+accumulator, so a run can resume from a partial file. Because the cell size is the
+`volblocksize`, a fingerprint is comparable only between zvols at the **same**
+`volblocksize` (the file records the cell size and mismatches are rejected on read).
+It is computed by `--fingerprint-only`, by `--align-guids-to` (to check each replayed
+snapshot before forging), and by `--verify-fingerprint`; `--align-guids` computes none.
 
 ## Limitations
 
