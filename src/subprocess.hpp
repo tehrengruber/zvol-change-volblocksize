@@ -22,6 +22,10 @@ std::string check_output(const std::vector<std::string>& args);
 // Run a command inheriting this process's stdout/stderr; throw on non-zero exit.
 void check_call(const std::vector<std::string>& args);
 
+// Run a command feeding `input` to its stdin (stdout/stderr inherited); throw on
+// non-zero exit.  Intended for small inputs that fit the pipe buffer.
+void check_call_input(const std::vector<std::string>& args, const std::string& input);
+
 // Run a command inheriting stdio and return its exit code (no throw).
 int call_status(const std::vector<std::string>& args);
 

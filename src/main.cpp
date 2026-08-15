@@ -14,6 +14,7 @@
 
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <sys/file.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
 
@@ -28,6 +29,7 @@
 #include <cstring>
 #include <deque>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <map>
@@ -38,6 +40,9 @@
 #include <thread>
 #include <vector>
 
+#include "guidstream.hpp"
+#include "lthash.hpp"
+#include "sha256.hpp"
 #include "subprocess.hpp"
 
 namespace {
@@ -126,6 +131,7 @@ uint64_t to_u64(const std::string& s, const std::string& what) {
         throw MigrateError(what + ": expected a number but got '" + s + "'");
     return v;
 }
+
 
 // Same, but for a possibly-signed value (FREE length can be -1); returns int64.
 int64_t to_i64(const std::string& s, const std::string& what) {
@@ -315,19 +321,21 @@ class Progress {
     void update(uint64_t done) {
         if (!tty_) return;
         auto now = std::chrono::steady_clock::now();
-        // Keep a sliding window of samples so the displayed speed reflects the last
-        // ~10 seconds rather than the whole-run average.
-        window_.emplace_back(now, done);
-        while (window_.size() > 1 &&
-               now - window_.front().first > std::chrono::seconds(10))
-            window_.pop_front();
-
-        // Repaint at most once per second so the transfer rate stays readable
-        // (and doesn't flicker on a fast device), unless we've reached the end.
+        // Repaint (and do all the work below) at most once per second, so a high tick
+        // rate -- one call per write record -- costs only this clock read and compare,
+        // never a window push, string format, or draw.  Always fall through once we've
+        // reached the end so the final state is drawn.
         if (drawn_ && done < total_ && now - last_draw_time_ < std::chrono::seconds(1))
             return;
         drawn_ = true;
         last_draw_time_ = now;
+
+        // Sample the sliding window only when we repaint, so it holds ~one entry per
+        // second (a bounded ~10) and the shown speed reflects the last ~10 seconds.
+        window_.emplace_back(now, done);
+        while (window_.size() > 1 &&
+               now - window_.front().first > std::chrono::seconds(10))
+            window_.pop_front();
 
         double wsecs =
             std::chrono::duration<double>(now - window_.front().first).count();
@@ -367,8 +375,11 @@ class Progress {
         drawn_ = false;
     }
 
-   private:
+    // Change the leading label shown on the bar (e.g. the item being processed);
+    // takes effect on the next update().
+    void set_label(std::string label) { label_ = std::move(label); }
 
+   private:
     std::string label_;
     uint64_t total_;
     bool tty_;
@@ -380,19 +391,54 @@ class Progress {
     std::deque<std::pair<std::chrono::steady_clock::time_point, uint64_t>> window_;
 };
 
+// ---- device handles ------------------------------------------------------ //
+
+// An owning file descriptor: closes on destruction, move-only.  `.get()` yields the raw
+// fd for syscalls and for the non-owning Image view.
+class Fd {
+   public:
+    Fd() = default;
+    explicit Fd(int fd) : fd_(fd) {}
+    Fd(Fd&& o) noexcept : fd_(o.fd_) { o.fd_ = -1; }
+    Fd& operator=(Fd&& o) noexcept {
+        if (this != &o) {
+            reset();
+            fd_ = o.fd_;
+            o.fd_ = -1;
+        }
+        return *this;
+    }
+    Fd(const Fd&) = delete;
+    Fd& operator=(const Fd&) = delete;
+    ~Fd() { reset(); }
+    void reset() {
+        if (fd_ >= 0) close(fd_);
+        fd_ = -1;
+    }
+    int get() const { return fd_; }
+    explicit operator bool() const { return fd_ >= 0; }
+
+   private:
+    int fd_ = -1;
+};
+
+// Open a device, throwing a clear error naming `what` if it cannot be opened.
+Fd open_device(const std::string& path, int flags, const std::string& what) {
+    int fd = open(path.c_str(), flags);
+    if (fd < 0) throw MigrateError("cannot open " + what);
+    return Fd(fd);
+}
+
 // ---- applying changed ranges to the destination device ------------------- //
 
 class RangeApplier {
    public:
     RangeApplier(const std::string& src_dev, int dst_fd, uint64_t blocksize,
                  uint64_t volsize)
-        : dst_fd_(dst_fd), bs_(blocksize), volsize_(volsize) {
-        src_fd_ = open(src_dev.c_str(), O_RDONLY);
-        if (src_fd_ < 0) throw MigrateError("cannot open source device " + src_dev);
-    }
-    ~RangeApplier() {
-        if (src_fd_ >= 0) close(src_fd_);
-    }
+        : src_fd_(open_device(src_dev, O_RDONLY, "source device " + src_dev)),
+          dst_fd_(dst_fd),
+          bs_(blocksize),
+          volsize_(volsize) {}
 
     void write(uint64_t offset, uint64_t length) {
         uint64_t end = offset + length;
@@ -413,7 +459,7 @@ class RangeApplier {
         while (pos < end) {
             throw_if_interrupted();
             size_t want = std::min<uint64_t>(CHUNK, end - pos);
-            ssize_t got = pread(src_fd_, buf_.data(), want, pos);
+            ssize_t got = pread(src_fd_.get(), buf_.data(), want, pos);
             if (got < 0)
                 throw MigrateError("read error on source device at offset " +
                                    std::to_string(pos) + ": " +
@@ -427,6 +473,9 @@ class RangeApplier {
             if (pwrite(dst_fd_, buf_.data(), got, pos) != got)
                 throw MigrateError("short write to destination at offset " +
                                    std::to_string(pos));
+            // Hand the just-read bytes to the data sink (the fingerprint) so it can hash
+            // them without a second read of the source.
+            if (on_written_) on_written_(pos, static_cast<uint64_t>(got), buf_.data());
             bytes_written_ += static_cast<uint64_t>(got);
             pos += static_cast<uint64_t>(got);
             if (on_progress_) on_progress_(bytes_written_);
@@ -440,6 +489,7 @@ class RangeApplier {
             len = static_cast<int64_t>(volsize_) - static_cast<int64_t>(offset);
         if (len <= 0) return;
         uint64_t ulen = static_cast<uint64_t>(len);
+        if (on_freed_) on_freed_(offset, ulen);  // tell the data sink this range is a hole now
         bytes_freed_ += ulen;
         uint64_t a = align_up(offset, bs_);
         uint64_t b = (offset + ulen) / bs_ * bs_;
@@ -456,6 +506,13 @@ class RangeApplier {
     uint64_t bytes_freed() const { return bytes_freed_; }
     void set_progress(std::function<void(uint64_t)> cb) {
         on_progress_ = std::move(cb);
+    }
+    // Feed applied data to a sink (the fingerprint): `on_written(off, len, data)` for each
+    // flushed write chunk, `on_freed(off, len)` for each freed range.
+    void set_data_sink(std::function<void(uint64_t, uint64_t, const char*)> on_written,
+                       std::function<void(uint64_t, uint64_t)> on_freed) {
+        on_written_ = std::move(on_written);
+        on_freed_ = std::move(on_freed);
     }
 
    private:
@@ -475,7 +532,7 @@ class RangeApplier {
         }
     }
 
-    int src_fd_ = -1;
+    Fd src_fd_;
     int dst_fd_;
     uint64_t bs_;
     uint64_t volsize_;
@@ -484,6 +541,8 @@ class RangeApplier {
     uint64_t bytes_written_ = 0, bytes_freed_ = 0;
     std::vector<char> buf_ = std::vector<char>(CHUNK);
     std::function<void(uint64_t)> on_progress_;
+    std::function<void(uint64_t, uint64_t, const char*)> on_written_;
+    std::function<void(uint64_t, uint64_t)> on_freed_;
 };
 
 // ---- migration ----------------------------------------------------------- //
@@ -506,6 +565,16 @@ struct Options {
     VerifyMode verify = VerifyMode::None;
     std::optional<std::string> verify_snap;  // set iff verify == One (short name)
     bool verify_only = false;  // just compare an existing dest; no transfer
+
+    // GUID alignment (experimental).  At most one of align_guids / align_to is set.
+    bool align_guids = false;                  // forge GUIDs derived from source GUIDs
+    std::optional<std::string> align_to;       // forge the GUIDs from this file
+    bool allow_missing_fingerprints = false;   // --align-guids-to: source-derive absentees
+    std::optional<std::string> fingerprint_out;  // where --fingerprint-only writes
+    bool fingerprint_only = false;             // standalone: just write a fingerprint
+    std::optional<std::string> verify_fingerprint;  // standalone: check against a file
+
+    bool aligning() const { return align_guids || align_to.has_value(); }
 };
 
 Options g_opts;
@@ -545,6 +614,42 @@ uint64_t parse_size(const std::string& text) {
         throw MigrateError("invalid size: " + text + " (expected e.g. 8192, 16k, 1m)");
     return v * mult;
 }
+
+// An advisory, non-blocking, whole-run lock keyed by the destination, so two
+// invocations can't clobber the same destination.  Released automatically when the
+// process exits (even on SIGKILL -- the kernel drops the flock when the fd closes).
+class FileLock {
+   public:
+    explicit FileLock(const std::string& dataset) {
+        std::string key = dataset;
+        for (char& c : key)
+            if (c == '/' || c == '@') c = '_';
+        path_ = "/run/lock/zvol-change-volblocksize-" + key + ".lock";
+        fd_ = open(path_.c_str(), O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (fd_ < 0)  // /run/lock should exist on Linux; fall back to /tmp if not
+            fd_ = open((path_ = "/tmp/zvol-change-volblocksize-" + key + ".lock").c_str(),
+                       O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+        if (fd_ < 0) throw MigrateError("cannot open lock file " + path_);
+        if (flock(fd_, LOCK_EX | LOCK_NB) != 0) {
+            int e = errno;
+            close(fd_);
+            fd_ = -1;
+            if (e == EWOULDBLOCK)
+                throw MigrateError("another migration is already in progress for " +
+                                   dataset + " (lock " + path_ + ")");
+            throw MigrateError("cannot lock " + path_ + ": " + std::strerror(e));
+        }
+    }
+    ~FileLock() {
+        if (fd_ >= 0) close(fd_);  // drops the flock
+    }
+    FileLock(const FileLock&) = delete;
+    FileLock& operator=(const FileLock&) = delete;
+
+   private:
+    int fd_ = -1;
+    std::string path_;
+};
 
 void create_dest(const std::string& dest, uint64_t blocksize, uint64_t volsize) {
     std::vector<std::string> cmd = {"zfs",  "create",  "-s", "-V",
@@ -597,6 +702,229 @@ void copy_holds(const std::string& src_snap, const std::string& dst_snap) {
     }
 }
 
+// ---- GUID alignment (experimental) --------------------------------------- //
+//
+// Two independently-reblocked copies of a dataset on different pools get fresh,
+// non-matching snapshot GUIDs and so can't be `zfs send -i`-replicated to each
+// other, even though their data is identical.  Alignment forges each migrated
+// snapshot's GUID via a data-less `zfs recv` so the copies share snapshot
+// identity.  See README "GUID alignment" for the full rationale and caveats.
+
+// A snapshot's content fingerprint is an LtHash (see lthash.hpp) over cells of the
+// zvol's own volblocksize: H(next) is H(prev) with each changed cell's old
+// contribution removed and its new one added, so it updates in time proportional to
+// the change, never re-reading holes.  The value recorded in a file is the full
+// accumulator (serialized), so a resume can reload it and continue.  Cell = volblocksize
+// means the fingerprint is comparable only between zvols at the same volblocksize --
+// exactly the ones that can replicate to each other -- so the file records the cell size
+// and mismatches are rejected on read.
+
+// One snapshot's entry in a fingerprint file.
+struct Fingerprint {
+    std::string snap;     // short name
+    uint64_t volsize;
+    std::string state;    // the full LtHash accumulator after this snapshot, serialized as
+                          // hex -- the content fingerprint itself, not its digest, so a
+                          // resume can reload it and continue the incremental computation
+    uint64_t guid;
+};
+
+// A parsed fingerprint file: its cell size and the per-snapshot entries.  Each entry
+// carries the full accumulator after that snapshot, so resuming needs only the last
+// entry -- there is no separate whole-file state.
+struct FingerprintFile {
+    uint64_t cellsize;
+    std::map<std::string, Fingerprint> entries;
+};
+
+// A cellular image to read from: an open device and its size.  Always a real device;
+// "no image" (all holes) is represented by an unset std::optional<Image>, not a
+// sentinel fd.
+struct Image {
+    int fd;
+    uint64_t volsize;
+};
+
+// An incremental fingerprinter for one snapshot.  It holds the running LtHash
+// accumulator (`h`) and every cell's cached seed (LtHash::HOLE for a hole;
+// LtHash::UNKNOWN when resuming from a persisted accumulator, before the cell's old
+// content is read), together with the snapshot being hashed (`cur`) and its predecessor
+// (`prev`; an unset image reads as all holes, e.g. the very first snapshot).  A cell's
+// old content is read from `prev` only when its seed is UNKNOWN, so `prev` need only be
+// set when a resume might have left UNKNOWN seeds.  Rather than re-point one long-lived
+// object at each snapshot, callers derive the next snapshot's fingerprinter from the
+// previous one (the accumulated state moves forward; the images are new).
+struct Fingerprinter {
+    LtHash h;
+    std::vector<uint64_t> seeds;
+    uint64_t cellsize;
+    std::optional<Image> cur, prev;  // hashed snapshot + predecessor; unset = all holes
+    std::vector<uint8_t> seen;       // per-snapshot dedup of already-hashed cells
+    std::vector<char> ob, nb;        // scratch: old cell, and a read/straddle cell
+
+    // An empty accumulator with no images yet -- used to seed resume state (load `h`,
+    // mark base cells UNKNOWN) before the first snapshot's devices are opened.
+    explicit Fingerprinter(uint64_t cellsize)
+        : cellsize(cellsize), ob(cellsize), nb(cellsize) {}
+
+    // The next snapshot: carry `prev_fp`'s accumulated state (h + cached seeds) forward
+    // onto fresh images, sized for the `ncells` this snapshot spans.
+    Fingerprinter(Fingerprinter&& prev_fp, Image cur, std::optional<Image> prev,
+                  uint64_t ncells)
+        : h(std::move(prev_fp.h)), seeds(std::move(prev_fp.seeds)),
+          cellsize(prev_fp.cellsize), cur(cur), prev(prev), seen(ncells, 0),
+          ob(cellsize), nb(cellsize) {
+        if (seeds.size() < ncells) seeds.resize(ncells, LtHash::HOLE);
+    }
+
+    // Hash the cells overlapping [offset, offset+len), deduping repeats within the
+    // snapshot.  A cell straddling an edge of the range keeps bytes outside it, so it is
+    // always read whole from `cur`; the three entry points differ only in where a
+    // fully-covered cell's new content comes from:
+    //   update_data  -- it is `data` (the applier's just-written buffer -- no re-read)
+    //   update_read  -- read it from `cur` (no buffer available)
+    //   update_freed -- the range was freed, so the cell becomes a hole
+    void update_data(uint64_t offset, uint64_t len, const char* data) {
+        hash_span(offset, len, New::Data, data);
+    }
+    void update_read(uint64_t offset, uint64_t len) {
+        hash_span(offset, len, New::Read, nullptr);
+    }
+    void update_freed(uint64_t offset, uint64_t len) {
+        hash_span(offset, len, New::Freed, nullptr);
+    }
+
+   private:
+    enum class New { Data, Read, Freed };
+    void hash_span(uint64_t offset, uint64_t len, New src, const char* data);
+    // Advance cell `idx` to `cell` (cellsize bytes, or nullptr for a hole): remove the old
+    // cell via its cached seed (or, if UNKNOWN, by reading `prev`), then add the new.
+    void update_cell(uint64_t idx, const char* cell);
+};
+
+uint64_t volsize_of(const std::string& dataset) {
+    return to_u64(zfs_get(dataset, "volsize"), dataset + " volsize");
+}
+
+// Deterministic 64-bit GUID for a forged snapshot, derived from the *source*
+// snapshot's own GUID.  Two pools holding the same dataset (replicas synced with
+// zfs send/recv) share identical source-snapshot GUIDs, so both independently
+// derive the same forged GUID -- and because source GUIDs are unique per snapshot,
+// the derived GUIDs are unique too.  (Deriving from the source GUID, rather than
+// from a content hash, avoids collisions between snapshots with identical content
+// -- e.g. two consecutive no-change snapshots -- which a content hash would map to
+// the same GUID.)  It is a hash of the source GUID, not the GUID itself, so it
+// can't clash with the preserved original ("-old") snapshots that keep the source
+// GUIDs.  For the case where the two sides' source GUIDs do *not* match but their
+// content does, use the fingerprint-file path (--fingerprint-only / --align-guids-to).
+uint64_t derive_guid(uint64_t source_guid) {
+    unsigned char le[8];  // hash the little-endian bytes, so it's arch-independent
+    for (int i = 0; i < 8; ++i) le[i] = static_cast<unsigned char>(source_guid >> (8 * i));
+    sha256::Digest d = sha256::raw_of(le, sizeof le);
+    uint64_t g = 0;
+    for (int i = 0; i < 8; ++i) g = (g << 8) | d[i];
+    return g ? g : 1;  // ZFS rejects a zero GUID
+}
+
+// Create dest@shortname carrying a chosen GUID: snapshot twice (identical), emit
+// their empty incremental, rewrite its toguid, and receive it back over the base.
+void forge_snapshot(const std::string& dest, const std::string& shortname,
+                    uint64_t guid) {
+    std::string target = dest + "@" + shortname;
+    std::string t1 = dest + "@" + shortname + "_zcvbtmp1";
+    std::string t2 = dest + "@" + shortname + "_zcvbtmp2";
+    // Best-effort removal of both temp snapshots (each independently, so one missing
+    // doesn't skip the other); ignores "no such snapshot".  A forge that failed or was
+    // interrupted after creating a temp would otherwise leave it behind and block a
+    // later --resume-from (which re-forges this snapshot) at the `zfs snapshot` below,
+    // so we clear any stale temps up front and unwind the ones we create on any error.
+    auto destroy_temps = [&] {
+        sp::run_quiet({"zfs", "destroy", t1});
+        sp::run_quiet({"zfs", "destroy", t2});
+    };
+    destroy_temps();
+    try {
+        run_mutate({"zfs", "snapshot", t1});
+        run_mutate({"zfs", "snapshot", t2});  // no writes between -> empty delta
+        std::string stream = sp::check_output({"zfs", "send", "-i", t1, t2});
+        std::string forged = guidstream::rewrite_toguid(stream, guid);
+        run_mutate({"zfs", "destroy", t2});
+        // recv the empty delta over the base (t1) so @shortname inherits t1's content
+        // but the forged GUID.  No -F: the volume is already at t1 (its latest
+        // snapshot, nothing written since), so a clean incremental applies -- and if
+        // it somehow diverged we want a hard error here, not a forced rollback that
+        // discards data.
+        sp::check_call_input({"zfs", "recv", target}, forged);
+        run_mutate({"zfs", "destroy", t1});
+    } catch (...) {
+        destroy_temps();  // don't leave temps behind to block a resume
+        throw;
+    }
+}
+
+// Write the fingerprint of `fps` to `path` ("-" = stdout), tagged with `dataset`.
+// While the standalone --fingerprint-only task is in progress this is called repeatedly
+// with `complete=false`; the final call (`complete=true`) appends a trailing
+// "# dataset ... complete" header so a reader can tell the file was fully written.
+void write_fingerprint(const std::string& path, const std::string& dataset,
+                       uint64_t cellsize, const std::vector<Fingerprint>& fps,
+                       bool complete) {
+    std::ostringstream body;
+    body << "# zvol-change-volblocksize fingerprint v1\n"
+         << "# dataset " << dataset << (complete ? "" : " (in progress)") << "\n"
+         << "# cellsize " << cellsize << "\n";
+    // Each row's fingerprint is the full LtHash accumulator after that snapshot (hex), so
+    // a resume can reload the last row and continue -- no separate whole-file state line.
+    body << "# columns: snapshot volsize fingerprint guid\n";
+    for (const auto& f : fps)
+        body << f.snap << ' ' << f.volsize << ' ' << f.state << ' ' << f.guid << '\n';
+    if (complete)
+        body << "# dataset " << dataset << " complete (" << fps.size() << " snapshots)\n";
+    if (path == "-") {
+        std::cout << body.str();
+        return;
+    }
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) throw MigrateError("cannot write fingerprint file: " + path);
+    out << body.str();
+    if (!out) throw MigrateError("error writing fingerprint file: " + path);
+}
+
+FingerprintFile read_fingerprint(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) throw MigrateError("cannot open fingerprint file: " + path);
+    FingerprintFile out{0, {}};
+    bool saw_header = false;
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string t = trim(line);
+        if (t.empty()) continue;
+        if (t[0] == '#') {
+            std::vector<std::string> w = split_ws(t);
+            // "# zvol-change-volblocksize fingerprint v1"
+            if (w.size() >= 4 && w[2] == "fingerprint")
+                saw_header = true;
+            else if (w.size() >= 3 && w[1] == "cellsize")
+                out.cellsize = to_u64(w[2], "fingerprint cellsize");
+            continue;
+        }
+        std::vector<std::string> f = split_ws(t);
+        if (f.size() != 4)
+            throw MigrateError("malformed fingerprint line: " + t);
+        Fingerprint fp{f[0], to_u64(f[1], "fingerprint volsize"), f[2],
+                       to_u64(f[3], "fingerprint guid")};
+        out.entries[fp.snap] = fp;
+    }
+    if (!saw_header)
+        throw MigrateError("not a zvol-change-volblocksize fingerprint file: " + path);
+    if (out.cellsize == 0)
+        throw MigrateError("fingerprint file has no cell size (from an older, "
+                           "incompatible build?): " + path);
+    if (out.entries.empty())
+        throw MigrateError("fingerprint file has no entries: " + path);
+    return out;
+}
+
 // The send command that reproduces `snapshots[i]` (full for the first, else
 // incremental from the previous snapshot).
 std::vector<std::string> send_command(const std::vector<std::string>& snapshots,
@@ -606,9 +934,145 @@ std::vector<std::string> send_command(const std::vector<std::string>& snapshots,
                                              snapshots[i]};
 }
 
-void replay(const std::string& dest, uint64_t blocksize,
-            const std::vector<std::string>& snapshots,
-            const std::vector<std::string>& zstream_cmd, size_t start) {
+// Read cell `idx` (cellsize bytes) of `img` into `buf`, zero-padding the tail past the
+// volume.  An unset image is all-zero (a hole).  Returns the valid byte count.
+uint64_t read_cell(const std::optional<Image>& img, uint64_t cellsize, uint64_t idx,
+                   std::vector<char>& buf) {
+    std::fill(buf.begin(), buf.end(), 0);
+    if (!img) return 0;
+    uint64_t off = idx * cellsize;
+    uint64_t n = off < img->volsize ? std::min<uint64_t>(cellsize, img->volsize - off) : 0;
+    if (n && !sp::pread_full(img->fd, buf.data(), n, off))
+        throw MigrateError("read error hashing image at offset " + std::to_string(off));
+    return n;
+}
+
+void Fingerprinter::update_cell(uint64_t idx, const char* cell) {
+    uint64_t& seed = seeds[idx];
+    if (seed == LtHash::UNKNOWN) {  // resume: read the old block and subtract by content
+        read_cell(prev, cellsize, idx, ob);  // unset prev -> old cell was a hole
+        h.remove(idx, ob.data(), cellsize);
+    } else {
+        h.sub_seed(seed);  // out with the old cell (no-op if a hole)
+    }
+    seed = cell ? h.add(idx, cell, cellsize) : LtHash::HOLE;  // nullptr -> hole (add is a no-op)
+}
+
+void Fingerprinter::hash_span(uint64_t offset, uint64_t len, New src, const char* data) {
+    if (len == 0) return;
+    for (uint64_t idx = offset / cellsize; idx <= (offset + len - 1) / cellsize; ++idx) {
+        if (idx >= seen.size() || seen[idx]) continue;
+        seen[idx] = 1;
+        uint64_t cs = idx * cellsize;
+        bool covered = cs >= offset && cs + cellsize <= offset + len;
+        if (!covered) {  // straddle: the cell keeps bytes outside the range -> read it whole
+            read_cell(cur, cellsize, idx, nb);
+            update_cell(idx, nb.data());
+        } else if (src == New::Data) {
+            update_cell(idx, data + (cs - offset));  // reuse the applier's written bytes
+        } else if (src == New::Read) {
+            read_cell(cur, cellsize, idx, nb);
+            update_cell(idx, nb.data());
+        } else {  // New::Freed
+            update_cell(idx, nullptr);  // a fully-freed cell is a hole
+        }
+    }
+}
+
+// Fingerprint `snaps[start..]` (full names, creation order) into `fp`, incrementally
+// off each snapshot's `zfs send -i` change stream, so the work is O(change).  With
+// `start > 0`, `fp` must already reflect `snaps[start-1]` -- and a seed of
+// LtHash::UNKNOWN means "not loaded, read the old block from the previous snapshot" (the
+// resume path, which avoids re-reading the base).  `out`, when given, collects each
+// snapshot's Fingerprint; `on_fingerprint` is invoked after each so a caller can
+// persist.  With `show_progress`, draws a bar measured by logical change bytes.
+void fingerprint_snapshots(
+    const std::vector<std::string>& snaps,
+    const std::vector<std::string>& zstream_cmd, size_t start, Fingerprinter& fp,
+    std::optional<std::reference_wrapper<std::vector<Fingerprint>>> out = std::nullopt,
+    bool show_progress = false,
+    const std::function<void(const std::vector<Fingerprint>&)>& on_fingerprint = {}) {
+    uint64_t cellsize = fp.cellsize;
+    std::optional<Progress> progress;
+    uint64_t done = 0;
+    if (show_progress && isatty(STDERR_FILENO)) {
+        uint64_t total = 0;
+        for (size_t i = start; i < snaps.size(); ++i)
+            total += estimate_change(send_command(snaps, i));
+        progress.emplace("fingerprinting " + std::to_string(snaps.size() - start) +
+                             " snapshots", total);
+    }
+    auto tick = [&](uint64_t n) {
+        if (progress) {
+            done += n;
+            progress->update(done);
+        }
+    };
+
+    // The previous snapshot's device -- read only for UNKNOWN (resume) cells, and chained
+    // as each snapshot's predecessor -- is opened here and owned by `prev_fd` (RAII).
+    std::optional<Image> prev;
+    Fd prev_fd;
+    if (start > 0) {
+        prev_fd = open_device(wait_for_device("/dev/zvol/" + snaps[start - 1]), O_RDONLY,
+                              "snapshot device for " + snaps[start - 1]);
+        prev = Image{prev_fd.get(), volsize_of(snaps[start - 1])};
+    }
+    for (size_t i = start; i < snaps.size(); ++i) {
+        throw_if_interrupted();
+        const std::string& snap = snaps[i];
+        std::string sh = snap.substr(snap.find('@') + 1);
+        if (progress)
+            progress->set_label("fingerprinting @" + sh + " (" +
+                                std::to_string(i - start + 1) + "/" +
+                                std::to_string(snaps.size() - start) + ")");
+        uint64_t vs = volsize_of(snap);
+        uint64_t prev_vs = prev ? prev->volsize : 0;
+        // The map of cells spans both volsizes so a shrink's dropped tail cells have a
+        // slot.  This path has no applier buffer, so it reads each written cell from the
+        // snapshot device (`cur`); a freed cell becomes a hole (straddle-safe).
+        uint64_t ncells = (std::max(vs, prev_vs) + cellsize - 1) / cellsize;
+        Fd cur_fd = open_device(wait_for_device("/dev/zvol/" + snap), O_RDONLY,
+                                "snapshot device for " + snap);
+        fp = Fingerprinter{std::move(fp), Image{cur_fd.get(), vs}, prev, ncells};
+        for_each_change(send_command(snaps, i), zstream_cmd, [&](const Change& c) {
+            throw_if_interrupted();
+            uint64_t len = c.length < 0 ? (vs > c.offset ? vs - c.offset : 0)
+                                        : static_cast<uint64_t>(c.length);
+            if (len == 0 || c.offset >= vs) return;
+            len = std::min<uint64_t>(len, vs - c.offset);
+            if (c.op == Op::Write) {
+                fp.update_read(c.offset, len);
+                // Progress by logical bytes written, so it tracks the `zfs send -nP`
+                // total and never counts holes.
+                tick(len);
+            } else {
+                fp.update_freed(c.offset, len);
+            }
+        });
+        // A shrink drops the previous snapshot's cells past the new volsize.
+        if (prev_vs > vs) fp.update_freed(vs, prev_vs - vs);
+        if (out)
+            out->get().push_back(
+                {sh, vs, fp.h.serialize(), to_u64(zfs_get(snap, "guid"), "guid")});
+        if (out && on_fingerprint) on_fingerprint(out->get());
+        // This snapshot's still-open device becomes the next one's predecessor.
+        prev = Image{cur_fd.get(), vs};
+        prev_fd = std::move(cur_fd);
+    }
+    if (progress) progress->finish(done);
+}
+
+// Replays snapshots onto `dest`.  When aligning, forges each snapshot's GUID: with
+// `align_to` set it is the reference fingerprint, and each snapshot's GUID is forged only
+// after its replayed content matches the reference's stored accumulator; otherwise
+// (--align-guids) the GUID is derived from the source snapshot's GUID and no content
+// fingerprint is computed.
+void replay(
+    const std::string& dest, uint64_t blocksize, uint64_t cellsize,
+    const std::vector<std::string>& snapshots,
+    const std::vector<std::string>& zstream_cmd, size_t start,
+    const std::optional<std::map<std::string, Fingerprint>>& align_to) {
     std::string dst_dev = "/dev/zvol/" + dest;
 
     if (g_opts.dry_run) {
@@ -635,6 +1099,46 @@ void replay(const std::string& dest, uint64_t blocksize,
         if (g_opts.verbose) progress.message("[zvol-change-volblocksize] " + m);
     };
 
+    bool aligning = g_opts.aligning();
+    bool fingerprinting = align_to.has_value();  // only --align-guids-to computes a fingerprint
+    Fingerprinter fp(cellsize);               // running image fingerprint, align-to only
+
+    // Resuming an --align-guids-to run: seed the accumulator from the reference file's
+    // stored fingerprint for the resume base (start-1), so incremental hashing continues
+    // without re-reading the base.  Every already-migrated snapshot must still be in the
+    // reference with a matching dest GUID (that is what makes reusing the reference's
+    // accumulator sound); the base is required.  --align-guids has no fingerprint to seed.
+    // `resumed_lazy` records that base cells were marked UNKNOWN, so update_cell may need
+    // the previous source snapshot -- only then does the main loop open it.
+    bool resumed_lazy = false;
+    if (fingerprinting && start > 0) {
+        auto short_of = [](const std::string& s) { return s.substr(s.find('@') + 1); };
+        std::string base_sh = short_of(snapshots[start - 1]);
+        for (size_t i = 0; i < start; ++i) {
+            std::string sh = short_of(snapshots[i]);
+            auto it = align_to->find(sh);
+            if (it == align_to->end()) {
+                if (sh == base_sh)
+                    throw MigrateError(
+                        "--resume-from with --align-guids-to: the resume base @" + sh +
+                        " is not in the fingerprint");
+                continue;
+            }
+            if (it->second.guid != to_u64(zfs_get(dest + "@" + sh, "guid"), "guid"))
+                throw MigrateError("--resume-from with --align-guids-to: @" + sh +
+                                   " does not match the fingerprint's GUID");
+        }
+        // The base matched above; seed `h` from its stored accumulator and mark its cells
+        // UNKNOWN so the main loop lazily reads only the blocks each snapshot changes (from
+        // the previous source snapshot) rather than re-reading the whole base.
+        const Fingerprint& base = align_to->at(base_sh);
+        if (!fp.h.deserialize(base.state))
+            throw MigrateError("--align-guids-to: the fingerprint for the resume base @" +
+                               base_sh + " is unreadable");
+        fp.seeds.assign((base.volsize + cellsize - 1) / cellsize, LtHash::UNKNOWN);
+        resumed_lazy = true;
+    }
+
     for (size_t i = start; i < snapshots.size(); ++i) {
         const std::string& snap = snapshots[i];
         std::string shortname = snap.substr(snap.find('@') + 1);
@@ -651,26 +1155,78 @@ void replay(const std::string& dest, uint64_t blocksize,
 
         std::string src_dev = wait_for_device("/dev/zvol/" + snap);
         wait_for_device(dst_dev);
-        int dst_fd = open(dst_dev.c_str(), O_RDWR);
-        if (dst_fd < 0) throw MigrateError("cannot open destination " + dst_dev);
+        Fd dst_fd = open_device(dst_dev, O_RDWR, "destination " + dst_dev);
 
+        // The fingerprint is computed inline as we replay: each applied change also hashes
+        // the cells it touches by reading their new content from the *source* snapshot --
+        // the same bytes we write to the dest -- so no second pass over the flushed
+        // destination is needed.  The previous *source* snapshot's volsize bounds the cells
+        // that could have existed (a shrink drops the tail) and supplies old content for
+        // any UNKNOWN (lazy-resume) seeds.
+        uint64_t prev_vs = 0;
+        if (fingerprinting && i > 0)
+            prev_vs = to_u64(zfs_get(snapshots[i - 1], "volsize"),
+                             "previous snapshot volsize");
+
+        Fd src_fp_fd, prev_fp_fd;  // owned source handles; read only for straddle cells
+        uint64_t ncells = 0;
+        if (fingerprinting) {
+            src_fp_fd = open_device(src_dev, O_RDONLY, "source device " + src_dev);
+            // Read the previous source snapshot only for the UNKNOWN seeds a lazy resume
+            // left behind; a fresh run's seeds are all known, so it stays unset.
+            std::optional<Image> prev;
+            if (i > 0 && resumed_lazy) {
+                prev_fp_fd = open_device(wait_for_device("/dev/zvol/" + snapshots[i - 1]),
+                                         O_RDONLY,
+                                         "previous snapshot device for " + snapshots[i - 1]);
+                prev = Image{prev_fp_fd.get(), prev_vs};
+            }
+            // Derive this snapshot's fingerprinter from the previous one; `cur` is the
+            // source, read only for cells straddling a write range's edge.
+            ncells = (std::max(snap_volsize, prev_vs) + cellsize - 1) / cellsize;
+            fp = Fingerprinter{std::move(fp), Image{src_fp_fd.get(), snap_volsize}, prev,
+                               ncells};
+        }
+
+        std::optional<std::string> fingerprint;  // the replayed accumulator, if computed
         uint64_t wrote = 0, freed = 0;
         {
-            RangeApplier applier(src_dev, dst_fd, blocksize, dst_volsize);
+            RangeApplier applier(src_dev, dst_fd.get(), blocksize, dst_volsize);
             applier.set_progress([&](uint64_t w) { progress.update(done + w); });
+            // Hash the bytes the applier just read as it flushes them -- no second read of
+            // the source -- and turn a freed range into holes.
+            if (fingerprinting)
+                applier.set_data_sink(
+                    [&](uint64_t o, uint64_t l, const char* d) { fp.update_data(o, l, d); },
+                    [&](uint64_t o, uint64_t l) { fp.update_freed(o, l); });
             for_each_change(send_cmd, zstream_cmd, [&](const Change& c) {
                 throw_if_interrupted();
                 if (c.op == Op::Write)
                     applier.write(c.offset, static_cast<uint64_t>(c.length));
                 else
                     applier.free(c.offset, c.length);
+                // Keep the bar repainting on a steady ~1s cadence even between flushes
+                // (the applier coalesces contiguous writes, so its per-chunk callback
+                // fires only in bursts): otherwise the rate window samples unevenly and
+                // the shown speed jumps.  Progress itself throttles this to once per sec.
+                progress.update(done + applier.bytes_written());
             });
             applier.flush();
-            fsync(dst_fd);
+            fsync(dst_fd.get());
             wrote = applier.bytes_written();
             freed = applier.bytes_freed();
         }
-        close(dst_fd);
+        if (fingerprinting) {
+            // A shrink drops the previous source snapshot's cells past the new volsize.
+            if (prev_vs > snap_volsize)
+                fp.update_freed(snap_volsize, prev_vs - snap_volsize);
+            fingerprint = fp.h.serialize();
+        }
+        // Release the device handles before forging: forge_snapshot creates and destroys
+        // temporary dest snapshots, which an open dest device can make "busy".
+        dst_fd.reset();
+        src_fp_fd.reset();
+        prev_fp_fd.reset();
         done += wrote;
         vlog("  wrote " + std::to_string(wrote) + " bytes, freed " +
              std::to_string(freed) + " bytes (estimate " + std::to_string(estimate) +
@@ -689,88 +1245,95 @@ void replay(const std::string& dest, uint64_t blocksize,
                                  " were written (>10%)");
         }
 
-        run_mutate({"zfs", "snapshot", dest + "@" + shortname});
-        copy_holds(snap, dest + "@" + shortname);
+        std::string dst_snap = dest + "@" + shortname;
+        if (aligning) {
+            // Decide the GUID; for --align-guids-to, confirm the replayed content matches
+            // the reference's stored fingerprint *before* forging.  `fingerprint` is the
+            // LtHash accumulator computed inline above (present exactly when aligning to).
+            uint64_t guid;
+            if (align_to) {  // --align-guids-to: verify content, then use its GUID
+                auto it = align_to->find(shortname);
+                if (it != align_to->end()) {
+                    // align_to implies fingerprinting, so `fingerprint` is present here.
+                    // The reference records each snapshot's *source* volsize (from
+                    // --fingerprint-only), which is what `snap_volsize` is.
+                    if (it->second.volsize != snap_volsize ||
+                        it->second.state != *fingerprint)
+                        throw MigrateError(
+                            "--align-guids-to: replayed content of @" + shortname +
+                            " does not match the fingerprint; refusing to align");
+                    guid = it->second.guid;
+                } else if (g_opts.allow_missing_fingerprints) {
+                    // Not in the reference (e.g. an older backup snapshot): there is
+                    // nothing to align to, so derive from the source GUID, as
+                    // --align-guids would.  (The pre-transfer check enforced the flag.)
+                    guid = derive_guid(to_u64(zfs_get(snap, "guid"), "source guid"));
+                } else {
+                    throw MigrateError(
+                        "--align-guids-to: fingerprint has no entry for @" + shortname);
+                }
+            } else {  // --align-guids: derive deterministically from the source GUID
+                guid = derive_guid(to_u64(zfs_get(snap, "guid"), "source snapshot guid"));
+            }
+            forge_snapshot(dest, shortname, guid);
+            copy_holds(snap, dst_snap);
+            vlog("aligned @" + shortname + " guid=" + std::to_string(guid) +
+                 " fingerprint=" +
+                 (fingerprint ? fingerprint->substr(0, 12) + ".." : "(none)"));
+        } else {
+            run_mutate({"zfs", "snapshot", dst_snap});
+            copy_holds(snap, dst_snap);
+        }
     }
     progress.finish(done);
 }
 
 // ---- verification -------------------------------------------------------- //
 
-uint64_t volsize_of(const std::string& dataset) {
-    return to_u64(zfs_get(dataset, "volsize"), dataset + " volsize");
-}
 
 // Byte-compare the first `size` bytes of two devices, reporting cumulative bytes
-// read via `on_progress`.  Throws on a read error -- which is a different fact
-// from a content difference (the latter returns false).
-bool devices_identical(const std::string& dev_a, const std::string& dev_b,
-                       uint64_t size,
-                       const std::function<void(uint64_t)>& on_progress = {},
-                       uint64_t* first_diff = nullptr) {
-    int fa = open(dev_a.c_str(), O_RDONLY);
-    int fb = open(dev_b.c_str(), O_RDONLY);
-    if (fa < 0 || fb < 0) {
-        if (fa >= 0) close(fa);
-        if (fb >= 0) close(fb);
-        throw MigrateError("cannot open devices to verify: " + dev_a + ", " + dev_b);
-    }
+// read via `on_progress`.  Returns the offset of the first differing byte, or nullopt if
+// the two ranges are identical.  Throws on a read error -- a different fact from a content
+// difference (which just yields the offset).
+std::optional<uint64_t> first_difference(
+    const std::string& dev_a, const std::string& dev_b, uint64_t size,
+    const std::function<void(uint64_t)>& on_progress = {}) {
+    Fd fa = open_device(dev_a, O_RDONLY, "devices to verify: " + dev_a + ", " + dev_b);
+    Fd fb = open_device(dev_b, O_RDONLY, "devices to verify: " + dev_a + ", " + dev_b);
     std::vector<char> ba(CHUNK), bb(CHUNK);
-    bool equal = true;
-    try {
-        for (uint64_t pos = 0; pos < size && equal;) {
-            throw_if_interrupted();
-            size_t n = std::min<uint64_t>(CHUNK, size - pos);
-            if (!sp::pread_full(fa, ba.data(), n, pos) ||
-                !sp::pread_full(fb, bb.data(), n, pos))
-                throw MigrateError("read error while verifying at offset " +
-                                   std::to_string(pos));
-            if (std::memcmp(ba.data(), bb.data(), n) != 0) {
-                equal = false;
-                if (first_diff)  // pin down the exact byte for the message
-                    for (size_t k = 0; k < n; ++k)
-                        if (ba[k] != bb[k]) {
-                            *first_diff = pos + k;
-                            break;
-                        }
-            }
-            pos += n;
-            if (on_progress) on_progress(pos);
-        }
-    } catch (...) {
-        close(fa);
-        close(fb);
-        throw;
+    for (uint64_t pos = 0; pos < size;) {
+        throw_if_interrupted();
+        size_t n = std::min<uint64_t>(CHUNK, size - pos);
+        if (!sp::pread_full(fa.get(), ba.data(), n, pos) ||
+            !sp::pread_full(fb.get(), bb.data(), n, pos))
+            throw MigrateError("read error while verifying at offset " +
+                               std::to_string(pos));
+        if (std::memcmp(ba.data(), bb.data(), n) != 0)  // pin down the exact byte
+            for (size_t k = 0; k < n; ++k)
+                if (ba[k] != bb[k]) return pos + k;
+        pos += n;
+        if (on_progress) on_progress(pos);
     }
-    close(fa);
-    close(fb);
-    return equal;
+    return std::nullopt;
 }
 
 // True if [offset, offset+size) of the device reads back as all zeros.
 bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size,
                     const std::function<void(uint64_t)>& on_progress = {}) {
-    int fd = open(dev.c_str(), O_RDONLY);
-    if (fd < 0) throw MigrateError("cannot open device to verify: " + dev);
+    Fd fd = open_device(dev, O_RDONLY, "device to verify: " + dev);
     std::vector<char> buf(CHUNK);
     static const std::vector<char> zeros(CHUNK, 0);
     bool zero = true;
-    try {
-        for (uint64_t pos = 0; pos < size && zero;) {
-            throw_if_interrupted();
-            size_t n = std::min<uint64_t>(CHUNK, size - pos);
-            if (!sp::pread_full(fd, buf.data(), n, offset + pos))
-                throw MigrateError("read error while verifying tail at offset " +
-                                   std::to_string(offset + pos));
-            if (std::memcmp(buf.data(), zeros.data(), n) != 0) zero = false;
-            pos += n;
-            if (on_progress) on_progress(pos);
-        }
-    } catch (...) {
-        close(fd);
-        throw;
+    for (uint64_t pos = 0; pos < size && zero;) {
+        throw_if_interrupted();
+        size_t n = std::min<uint64_t>(CHUNK, size - pos);
+        if (!sp::pread_full(fd.get(), buf.data(), n, offset + pos))
+            throw MigrateError("read error while verifying tail at offset " +
+                               std::to_string(offset + pos));
+        if (std::memcmp(buf.data(), zeros.data(), n) != 0) zero = false;
+        pos += n;
+        if (on_progress) on_progress(pos);
     }
-    close(fd);
     return zero;
 }
 
@@ -816,12 +1379,11 @@ void verify(const std::string& new_ds, const std::string& orig_ds,
         uint64_t common = std::min(it.sa, it.sb);
         std::string da = wait_for_device("/dev/zvol/" + it.a);
         std::string db = wait_for_device("/dev/zvol/" + it.b);
-        uint64_t at = 0;
-        if (!devices_identical(da, db, common,
-                               [&](uint64_t n) { progress.update(done + n); }, &at))
+        if (auto at = first_difference(
+                da, db, common, [&](uint64_t n) { progress.update(done + n); }))
             throw MigrateError("verification FAILED: " + it.what +
                                " differs from the original at offset " +
-                               std::to_string(at) + " (" + human(at) + ")");
+                               std::to_string(*at) + " (" + human(*at) + ")");
         // If the destination was rounded up to the new blocksize, the extra tail
         // must read as zeros (what the README promises for that region).
         if (it.sa != it.sb) {
@@ -917,7 +1479,147 @@ void verify_only() {
     verify(dest, g_opts.source, mode);
 }
 
+// Fingerprint every snapshot of a zvol, in creation order, recording each
+// snapshot's own current GUID.  Uses the zvol's own volblocksize as the cell size
+// (returned alongside the entries) and hashes incrementally off the `zfs send -i`
+// change streams, so the scan is O(total changes) not O(volsize x snapshots).
+// Shared by both the --fingerprint-only and --verify-fingerprint tasks.
+std::pair<uint64_t, std::vector<Fingerprint>> compute_fingerprints(
+    const std::string& zvol, std::optional<uint64_t> cellsize_override = std::nullopt) {
+    if (zfs_get(zvol, "type") != "volume")
+        throw MigrateError(zvol + " is not a zvol");
+    // Use the zvol's own volblocksize as the cell size, unless a caller pins it (when
+    // verifying against a file, hash at that file's cell size so they are comparable).
+    uint64_t cellsize = cellsize_override.value_or(
+        to_u64(zfs_get(zvol, "volblocksize"), zvol + " volblocksize"));
+    std::vector<std::string> snaps = list_snapshots(zvol);
+    if (snaps.empty()) throw MigrateError(zvol + " has no snapshots");
+    std::optional<ScopedProp> guard;
+    if (!g_opts.dry_run) guard.emplace(zvol, "snapdev", "visible");
+    std::vector<std::string> zstream_cmd = which_zstream();
+    zstream_cmd.push_back("-v");
+
+    std::vector<Fingerprint> fps;
+    Fingerprinter fp(cellsize);
+    fingerprint_snapshots(snaps, zstream_cmd, /*start=*/0, fp, std::ref(fps),
+                          /*show_progress=*/true);
+    return {cellsize, fps};
+}
+
+// Standalone: write a fingerprint of the source's snapshots (no conversion).  The file
+// is rewritten after every snapshot so an interrupted run loses nothing, and if it
+// already exists the snapshots it already covers are kept and computation resumes after
+// them.
+void fingerprint_task() {
+    const std::string& zvol = g_opts.source;
+    if (zfs_get(zvol, "type") != "volume") throw MigrateError(zvol + " is not a zvol");
+    uint64_t cellsize = to_u64(zfs_get(zvol, "volblocksize"), zvol + " volblocksize");
+    std::vector<std::string> snaps = list_snapshots(zvol);
+    if (snaps.empty()) throw MigrateError(zvol + " has no snapshots");
+    std::string path = g_opts.fingerprint_out.value_or("-");
+    auto short_of = [](const std::string& s) { return s.substr(s.find('@') + 1); };
+
+    // Resume from an existing file: keep the leading snapshots it already covers and
+    // continue after them.  Instead of re-reading the last covered snapshot to rebuild
+    // the running state, load the accumulator from that snapshot's own fingerprint row and
+    // mark all its cells' seeds UNKNOWN -- so only cells actually changed after the resume
+    // point read their old block (lazily), never the whole base.
+    std::vector<Fingerprint> done;
+    size_t start = 0;
+    Fingerprinter fp(cellsize);
+    if (path != "-" && std::ifstream(path).good()) {
+        FingerprintFile ref = read_fingerprint(path);
+        if (ref.cellsize != cellsize)
+            throw MigrateError(
+                "existing fingerprint file " + path + " was made at volblocksize " +
+                std::to_string(ref.cellsize) + " but " + zvol + " is " +
+                std::to_string(cellsize) + "; delete it to recompute");
+        for (; start < snaps.size(); ++start) {
+            auto it = ref.entries.find(short_of(snaps[start]));
+            if (it == ref.entries.end()) break;
+            done.push_back(it->second);
+        }
+        std::cerr << "info: " << path << " already exists; resuming from it ("
+                  << done.size() << " of " << snaps.size()
+                  << " snapshots already fingerprinted) -- delete the file first if you "
+                     "want to recompute from scratch.\n";
+        if (start == snaps.size()) {
+            std::cerr << "Nothing to do; " << path << " already covers all snapshots.\n";
+            return;
+        }
+        if (start > 0) {
+            if (!fp.h.deserialize(done.back().state))
+                throw MigrateError(path + " has an unreadable fingerprint for @" +
+                                   done.back().snap + "; delete it to recompute");
+            uint64_t base_vs = volsize_of(snaps[start - 1]);
+            fp.seeds.assign((base_vs + cellsize - 1) / cellsize, LtHash::UNKNOWN);
+        }
+    }
+
+    std::optional<ScopedProp> guard;
+    if (!g_opts.dry_run) guard.emplace(zvol, "snapdev", "visible");
+    std::vector<std::string> zstream_cmd = which_zstream();
+    zstream_cmd.push_back("-v");
+
+    std::vector<Fingerprint> computed;  // snaps[start..], appended to the kept prefix
+    auto build_all = [&](const std::vector<Fingerprint>& partial) {
+        std::vector<Fingerprint> all(done.begin(), done.end());
+        all.insert(all.end(), partial.begin(), partial.end());
+        return all;
+    };
+    auto persist = [&](const std::vector<Fingerprint>& partial) {
+        if (path != "-" && !g_opts.dry_run)
+            write_fingerprint(path, zvol, cellsize, build_all(partial), /*complete=*/false);
+    };
+
+    fingerprint_snapshots(snaps, zstream_cmd, start, fp, std::ref(computed),
+                          /*show_progress=*/true, persist);
+
+    std::vector<Fingerprint> all = build_all(computed);
+    write_fingerprint(path, zvol, cellsize, all, /*complete=*/true);
+    if (path != "-")
+        std::cerr << "Wrote fingerprint of " << all.size() << " snapshots to " << path
+                  << ".\n";
+}
+
+// Standalone: recompute the source's fingerprints (incrementally) and compare them
+// to a file.  Exits non-zero if any snapshot differs or is missing.
+void verify_fingerprint_task() {
+    FingerprintFile ref = read_fingerprint(*g_opts.verify_fingerprint);
+    // Recompute at the reference's cell size so the two are directly comparable.
+    auto [cellsize, computed] = compute_fingerprints(g_opts.source, ref.cellsize);
+    (void)cellsize;
+    const std::map<std::string, Fingerprint>& want = ref.entries;
+    std::map<std::string, Fingerprint> have;
+    for (const auto& f : computed) have[f.snap] = f;
+
+    size_t ok = 0, bad = 0, missing = 0;
+    for (const auto& [sh, want_fp] : want) {
+        auto it = have.find(sh);
+        if (it == have.end()) {
+            std::cout << "MISSING @" << sh << "\n";
+            ++missing;
+            continue;
+        }
+        const Fingerprint& got = it->second;
+        bool match = (got.volsize == want_fp.volsize && got.state == want_fp.state);
+        std::cout << (match ? "OK     " : "DIFFER ") << "@" << sh
+                  << (got.guid == want_fp.guid ? "" : "  (guid differs)") << "\n";
+        match ? ++ok : ++bad;
+    }
+    std::cout << ok << " matched, " << bad << " differ, " << missing << " missing\n";
+    if (bad || missing) throw MigrateError("fingerprint verification failed");
+}
+
 void migrate() {
+    if (g_opts.fingerprint_only) {
+        fingerprint_task();
+        return;
+    }
+    if (g_opts.verify_fingerprint) {
+        verify_fingerprint_task();
+        return;
+    }
     if (g_opts.verify_only) {
         verify_only();
         return;
@@ -974,6 +1676,11 @@ void migrate() {
     std::string dest = g_opts.dest.empty() ? g_opts.source + "-new" : g_opts.dest;
     std::string backup = g_opts.source + g_opts.backup_suffix;
 
+    // Hold a whole-run advisory lock on the destination so a second invocation
+    // can't clobber it concurrently.  Released on any exit.
+    std::optional<FileLock> lock;
+    if (!g_opts.dry_run) lock.emplace(dest);
+
     auto exists = [](const std::string& ds) {
         return sp::run_quiet({"zfs", "list", ds}) == 0;
     };
@@ -1004,12 +1711,28 @@ void migrate() {
             throw MigrateError(
                 "--resume-from needs the destination " + dest +
                 " from the interrupted run, but it does not exist");
-        // The only check: the earlier snapshots already exist on the target.
+        // The earlier snapshots must already exist on the target.
         for (size_t i = 0; i < r; ++i)
             if (!exists(dest + "@" + short_of(snapshots[i])))
                 throw MigrateError("--resume-from " + g_opts.resume_from +
                                    ": expected " + dest + "@" + short_of(snapshots[i]) +
                                    " on the target but it is missing");
+
+        // Nothing must have been written to the destination since its newest
+        // migrated snapshot: `written@<newest>` must be 0.  Otherwise the live volume
+        // has diverged from the base the resume replays onto (an external write, or
+        // an interrupted mid-write), which would corrupt the resumed snapshot, so
+        // refuse unless --force.
+        std::string dest_newest = short_of(snapshots[r - 1]);
+        uint64_t dest_written =
+            to_u64(zfs_get(dest, "written@" + dest_newest), "written@" + dest_newest);
+        if (dest_written > 0 && !g_opts.force)
+            throw MigrateError(
+                dest + ": " + human(dest_written) + " written since its newest "
+                "migrated snapshot @" + dest_newest +
+                " -- the destination has diverged from the resume base. Inspect it "
+                "(or `zfs rollback " + dest + "@" + dest_newest +
+                "` to discard the change), or pass --force to replay over it.");
 
         // Show the size of the snapshot just before the resume point, so the base
         // the incremental builds on can be eyeballed on both sides.
@@ -1064,6 +1787,69 @@ void migrate() {
         " snapshots) to volblocksize=" + std::to_string(blocksize) +
         ", dest=" + dest);
 
+    // GUID alignment (experimental): announce, recommend verification, and load
+    // the target fingerprint for --align-guids-to (nullopt => source-derived GUIDs).
+    // The fingerprint's cell size is the target volblocksize when we produce one, and
+    // taken from the reference file when we align to one (the two migrations use the
+    // same volblocksize, so the file already carries the right value).
+    std::optional<std::map<std::string, Fingerprint>> align_to;
+    uint64_t fp_cellsize = blocksize;
+    if (g_opts.aligning()) {
+        std::cerr
+            << "warning: GUID alignment is EXPERIMENTAL and not thoroughly tested; "
+               "it forges snapshot identity and, if the two sides ever diverge, can "
+               "make replication misbehave -- use at your own risk.\n"
+               "  how it works: after replaying each snapshot its GUID is forged via a "
+               "data-less `zfs recv` so independently-reblocked copies on different "
+               "pools share snapshot identity and can be incrementally replicated.\n";
+        if (g_opts.align_to)
+            std::cerr << "  each snapshot's replayed content is checked against the "
+                         "fingerprint's checksum before its GUID is forged; a mismatch "
+                         "aborts the run.\n";
+        if (g_opts.verify != VerifyMode::All)
+            std::cerr << "  strongly recommended: add `--verify all` -- a full "
+                         "byte-compare of every migrated snapshot against the source, "
+                         "run after replay and before the name swap (note: GUIDs are "
+                         "already forged by then; a failed verify aborts before the "
+                         "swap but leaves the un-swapped --dest for inspection).\n";
+        if (g_opts.align_to) {
+            FingerprintFile ref = read_fingerprint(*g_opts.align_to);
+            fp_cellsize = ref.cellsize;  // hash at the reference's cell size to compare
+            align_to = std::move(ref.entries);
+        }
+    }
+
+    // Pre-transfer check: every snapshot we are about to migrate must have a
+    // fingerprint entry, so a partial reference fails immediately rather than part-way
+    // through the transfer.  --allow-missing-fingerprints instead lets the absent ones
+    // be migrated with a source-derived GUID (as --align-guids would).
+    if (align_to) {
+        auto short_of = [](const std::string& s) { return s.substr(s.find('@') + 1); };
+        std::vector<std::string> missing;
+        for (size_t i = start; i < snapshots.size(); ++i) {
+            std::string sh = short_of(snapshots[i]);
+            if (align_to->find(sh) == align_to->end()) missing.push_back(sh);
+        }
+        if (!missing.empty()) {
+            std::string list;  // cap the list so a long backup prefix stays readable
+            for (size_t k = 0; k < missing.size() && k < 8; ++k)
+                list += (k ? ", @" : "@") + missing[k];
+            if (missing.size() > 8)
+                list += ", ... (+" + std::to_string(missing.size() - 8) + " more)";
+            if (!g_opts.allow_missing_fingerprints)
+                throw MigrateError(
+                    "--align-guids-to: the fingerprint has no entry for " +
+                    std::to_string(missing.size()) + " snapshot(s) being migrated (" +
+                    list +
+                    "); pass --allow-missing-fingerprints to migrate those with a "
+                    "source-derived GUID instead");
+            std::cerr << "note: " << missing.size()
+                      << " snapshot(s) are not in the fingerprint (" << list
+                      << "); their GUIDs will be derived from the source snapshots "
+                         "(--allow-missing-fingerprints).\n";
+        }
+    }
+
     std::optional<ScopedProp> snapdev_guard;
     if (!g_opts.dry_run)
         snapdev_guard.emplace(g_opts.source, "snapdev", "visible");
@@ -1076,7 +1862,7 @@ void migrate() {
             create_dest(dest, blocksize, first_volsize);
             dest_created = true;
         }
-        replay(dest, blocksize, snapshots, zstream_cmd, start);
+        replay(dest, blocksize, fp_cellsize, snapshots, zstream_cmd, start, align_to);
 
         // Re-derive reservations the sparse create (-s) dropped, after the final
         // volsize and before verify/swap -- so the thick guarantee is never missing
@@ -1139,6 +1925,24 @@ const char* USAGE =
     "                        before the swap; fails on any mismatch.\n"
     "  --verify-only         only byte-compare an existing --dest against the\n"
     "                        source (no transfer); uses --verify MODE, default all\n"
+    "  --align-guids         (experimental) forge deterministic GUIDs (derived from\n"
+    "                        the source snapshot GUIDs) on the migrated snapshots so\n"
+    "                        independently-reblocked copies on different pools stay\n"
+    "                        replication-compatible (see --verify all)\n"
+    "  --align-guids-to FILE (experimental) forge the GUIDs recorded in a fingerprint\n"
+    "                        FILE (made by --fingerprint-only), but only after each\n"
+    "                        snapshot's replayed content matches that file's fingerprint;\n"
+    "                        a resume seeds its state from FILE\n"
+    "  --allow-missing-fingerprints  with --align-guids-to, migrate snapshots absent\n"
+    "                        from the fingerprint using a source-derived GUID instead\n"
+    "                        of failing -- e.g. converting a backup that still has older\n"
+    "                        snapshots the reference doesn't cover\n"
+    "  --fingerprint-only    just write a fingerprint of <source>'s snapshots and\n"
+    "                        exit (no conversion); writes to --fingerprint-out\n"
+    "  --fingerprint-out F   destination for --fingerprint-only ('-' for stdout);\n"
+    "                        not valid with the align modes\n"
+    "  --verify-fingerprint F  recompute <source>'s snapshot fingerprints and compare\n"
+    "                        them to FILE (no conversion); non-zero exit on mismatch\n"
     "  --dry-run             print planned actions without changing anything\n"
     "  -v, --verbose\n";
 
@@ -1189,6 +1993,18 @@ bool parse_args(int argc, char** argv) {
             }
         } else if (a == "--verify-only") {
             g_opts.verify_only = true;
+        } else if (a == "--align-guids") {
+            g_opts.align_guids = true;
+        } else if (a == "--align-guids-to") {
+            g_opts.align_to = next();
+        } else if (a == "--allow-missing-fingerprints") {
+            g_opts.allow_missing_fingerprints = true;
+        } else if (a == "--fingerprint-out") {
+            g_opts.fingerprint_out = next();
+        } else if (a == "--fingerprint-only") {
+            g_opts.fingerprint_only = true;
+        } else if (a == "--verify-fingerprint") {
+            g_opts.verify_fingerprint = next();
         } else if (a == "--dry-run") {
             g_opts.dry_run = true;
         } else if (a == "-v" || a == "--verbose") {
@@ -1198,6 +2014,40 @@ bool parse_args(int argc, char** argv) {
         } else {
             positional.push_back(a);
         }
+    }
+    if (g_opts.align_guids && g_opts.align_to)
+        throw MigrateError("--align-guids and --align-guids-to are mutually exclusive");
+    if (g_opts.allow_missing_fingerprints && !g_opts.align_to)
+        throw MigrateError("--allow-missing-fingerprints only applies with --align-guids-to");
+    // Fingerprint references are produced solely by --fingerprint-only.  --align-guids
+    // needs no fingerprint at all, and --align-guids-to reads its reference (and seeds a
+    // resume from it) via --align-guids-to <file> -- neither writes one.
+    if (g_opts.fingerprint_out && !g_opts.fingerprint_only)
+        throw MigrateError("--fingerprint-out is only valid with --fingerprint-only "
+                           "(alignment reads its reference via --align-guids-to <file>)");
+    // Standalone fingerprint tasks operate on <source-zvol> alone (no conversion).
+    if (g_opts.fingerprint_only || g_opts.verify_fingerprint) {
+        if (g_opts.fingerprint_only && g_opts.verify_fingerprint)
+            throw MigrateError(
+                "--fingerprint-only and --verify-fingerprint are mutually exclusive");
+        // The standalone fingerprint tasks don't convert anything, so an align mode
+        // alongside them is meaningless -- reject it rather than silently dropping it.
+        if (g_opts.aligning())
+            throw MigrateError("--fingerprint-only / --verify-fingerprint cannot be "
+                               "combined with --align-guids or --align-guids-to");
+        // These tasks read the snapshot devices for real (they make snapdev visible
+        // and scan every snapshot); --dry-run would just skip the snapdev guard and
+        // then stall waiting for device nodes that never appear, so reject the combo.
+        if (g_opts.dry_run)
+            throw MigrateError(
+                "--dry-run cannot be combined with --fingerprint-only or "
+                "--verify-fingerprint (these tasks only read; run them without it)");
+        if (positional.size() != 1) {
+            std::cerr << USAGE;
+            throw MigrateError("expected a single <source-zvol> for the fingerprint task");
+        }
+        g_opts.source = positional[0];
+        return true;
     }
     if (g_opts.verify_only) {
         if (positional.empty() || positional.size() > 2) {

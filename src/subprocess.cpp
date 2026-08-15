@@ -57,10 +57,23 @@ static pid_t spawn(const std::vector<std::string>& args, int in_fd = -1,
     return pid;
 }
 
+// Spawn but close `a`/`b` (pipe ends already owned by the caller) if fork fails,
+// so a failed spawn doesn't leak descriptors.
+static pid_t spawn_or_close(const std::vector<std::string>& args, int in_fd,
+                            int out_fd, int err_fd, int a, int b) {
+    try {
+        return spawn(args, in_fd, out_fd, err_fd);
+    } catch (...) {
+        if (a >= 0) close(a);
+        if (b >= 0) close(b);
+        throw;
+    }
+}
+
 std::string check_output(const std::vector<std::string>& args) {
     int fds[2];
     if (pipe2(fds, O_CLOEXEC) != 0) throw CommandError("pipe2() failed");
-    pid_t pid = spawn(args, -1, fds[1]);
+    pid_t pid = spawn_or_close(args, -1, fds[1], -1, fds[0], fds[1]);
     close(fds[1]);
     std::string out;
     char buf[65536];
@@ -96,11 +109,44 @@ void check_call(const std::vector<std::string>& args) {
                            join(args));
 }
 
+void check_call_input(const std::vector<std::string>& args,
+                      const std::string& input) {
+    int fds[2];
+    if (pipe2(fds, O_CLOEXEC) != 0) throw CommandError("pipe2() failed");
+    pid_t pid = spawn_or_close(args, fds[0], -1, -1, fds[0], fds[1]);  // stdin=read end
+    close(fds[0]);
+
+    // A child that dies mid-write would SIGPIPE us; ignore it and rely on the
+    // child's exit code to report the failure.
+    struct sigaction ign {}, old {};
+    ign.sa_handler = SIG_IGN;
+    sigaction(SIGPIPE, &ign, &old);
+    const char* p = input.data();
+    size_t left = input.size();
+    while (left > 0) {
+        ssize_t n = write(fds[1], p, left);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;  // child gone; exit code below is the real error
+        }
+        p += n;
+        left -= static_cast<size_t>(n);
+    }
+    close(fds[1]);
+    sigaction(SIGPIPE, &old, nullptr);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (exit_code(status) != 0)
+        throw CommandError("command failed (rc=" + std::to_string(exit_code(status)) +
+                           "): " + join(args));
+}
+
 int run_quiet(const std::vector<std::string>& args) {
     int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
     if (devnull < 0) throw CommandError("cannot open /dev/null");
-    pid_t pid = spawn(args, -1, devnull, devnull);
-    if (devnull >= 0) close(devnull);
+    pid_t pid = spawn_or_close(args, -1, devnull, devnull, devnull, -1);
+    close(devnull);
     int status = 0;
     waitpid(pid, &status, 0);
     return exit_code(status);
@@ -111,11 +157,28 @@ void pipeline_for_each_line(
     const std::vector<std::string>& consumer,
     const std::function<void(const std::string&)>& on_line) {
     int p1[2], p2[2];  // producer->consumer, consumer->parent
-    if (pipe2(p1, O_CLOEXEC) != 0 || pipe2(p2, O_CLOEXEC) != 0)
+    if (pipe2(p1, O_CLOEXEC) != 0) throw CommandError("pipe2() failed");
+    if (pipe2(p2, O_CLOEXEC) != 0) {
+        close(p1[0]);
+        close(p1[1]);
         throw CommandError("pipe2() failed");
+    }
 
-    pid_t prod = spawn(producer, -1, p1[1]);
-    pid_t cons = spawn(consumer, p1[0], p2[1]);
+    pid_t prod, cons;
+    try {
+        prod = spawn(producer, -1, p1[1]);
+    } catch (...) {
+        close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+        throw;
+    }
+    try {
+        cons = spawn(consumer, p1[0], p2[1]);
+    } catch (...) {
+        close(p1[0]); close(p1[1]); close(p2[0]); close(p2[1]);
+        kill(prod, SIGKILL);
+        waitpid(prod, nullptr, 0);
+        throw;
+    }
     close(p1[0]);
     close(p1[1]);
     close(p2[1]);
