@@ -28,6 +28,8 @@ set(cvb_tests
   head_is_newest_snapshot rejects_divergent_head
   snapdev_hidden_restored reservation_preserved refuses_silent_decrypt
   resume_from verify_only holds_transferred
+  verify_only_snapshot_mismatch verify_only_deep_mismatch
+  verify_only_rounded_tail_not_zero
   align_guids_deterministic align_guids_no_fingerprint_file
   align_guids_to_fingerprint align_guids_volsize_change
   fingerprint_standalone

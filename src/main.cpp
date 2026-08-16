@@ -1290,53 +1290,6 @@ void replay(
 
 // ---- verification -------------------------------------------------------- //
 
-
-// Byte-compare the first `size` bytes of two devices, reporting cumulative bytes
-// read via `on_progress`.  Returns the offset of the first differing byte, or nullopt if
-// the two ranges are identical.  Throws on a read error -- a different fact from a content
-// difference (which just yields the offset).
-std::optional<uint64_t> first_difference(
-    const std::string& dev_a, const std::string& dev_b, uint64_t size,
-    const std::function<void(uint64_t)>& on_progress = {}) {
-    Fd fa = open_device(dev_a, O_RDONLY, "devices to verify: " + dev_a + ", " + dev_b);
-    Fd fb = open_device(dev_b, O_RDONLY, "devices to verify: " + dev_a + ", " + dev_b);
-    std::vector<char> ba(CHUNK), bb(CHUNK);
-    for (uint64_t pos = 0; pos < size;) {
-        throw_if_interrupted();
-        size_t n = std::min<uint64_t>(CHUNK, size - pos);
-        if (!sp::pread_full(fa.get(), ba.data(), n, pos) ||
-            !sp::pread_full(fb.get(), bb.data(), n, pos))
-            throw MigrateError("read error while verifying at offset " +
-                               std::to_string(pos));
-        if (std::memcmp(ba.data(), bb.data(), n) != 0)  // pin down the exact byte
-            for (size_t k = 0; k < n; ++k)
-                if (ba[k] != bb[k]) return pos + k;
-        pos += n;
-        if (on_progress) on_progress(pos);
-    }
-    return std::nullopt;
-}
-
-// True if [offset, offset+size) of the device reads back as all zeros.
-bool device_is_zero(const std::string& dev, uint64_t offset, uint64_t size,
-                    const std::function<void(uint64_t)>& on_progress = {}) {
-    Fd fd = open_device(dev, O_RDONLY, "device to verify: " + dev);
-    std::vector<char> buf(CHUNK);
-    static const std::vector<char> zeros(CHUNK, 0);
-    bool zero = true;
-    for (uint64_t pos = 0; pos < size && zero;) {
-        throw_if_interrupted();
-        size_t n = std::min<uint64_t>(CHUNK, size - pos);
-        if (!sp::pread_full(fd.get(), buf.data(), n, offset + pos))
-            throw MigrateError("read error while verifying tail at offset " +
-                               std::to_string(offset + pos));
-        if (std::memcmp(buf.data(), zeros.data(), n) != 0) zero = false;
-        pos += n;
-        if (on_progress) on_progress(pos);
-    }
-    return zero;
-}
-
 // Byte-compare the migrated volume against the original.  All compares every
 // snapshot plus the live head; Head compares only the head; One compares only the
 // single named snapshot (verify_snap).  Shows one progress bar across all
@@ -1375,28 +1328,77 @@ void verify(const std::string& new_ds, const std::string& orig_ds,
     Progress progress("verifying " + std::to_string(items.size()) + " items", total);
     uint64_t done = 0;
 
-    for (const auto& it : items) {
-        uint64_t common = std::min(it.sa, it.sb);
-        std::string da = wait_for_device("/dev/zvol/" + it.a);
-        std::string db = wait_for_device("/dev/zvol/" + it.b);
-        if (auto at = first_difference(
-                da, db, common, [&](uint64_t n) { progress.update(done + n); }))
-            throw MigrateError("verification FAILED: " + it.what +
-                               " differs from the original at offset " +
-                               std::to_string(*at) + " (" + human(*at) + ")");
-        // If the destination was rounded up to the new blocksize, the extra tail
-        // must read as zeros (what the README promises for that region).
-        if (it.sa != it.sb) {
-            const std::string& bigger = it.sa > it.sb ? da : db;
-            if (!device_is_zero(bigger, common, std::max(it.sa, it.sb) - common,
-                                [&](uint64_t n) { progress.update(done + common + n); }))
-                throw MigrateError("verification FAILED: rounded-up tail of " +
-                                   it.what + " is not all zeros");
+    // Verify chunk-major: sweep the same offset across every item before advancing, so the
+    // CoW blocks that consecutive snapshots share stay warm in the ARC -- reading each
+    // snapshot end-to-end instead evicts and re-reads them.  Devices are opened in batches
+    // to bound the simultaneously-open fd count (two per item).
+    static const std::vector<char> zeros(CHUNK, 0);
+    std::vector<char> ba(CHUNK), bb(CHUNK);
+    constexpr size_t BATCH = 256;  // <= ~512 open device fds at once
+    struct Open {
+        Fd a, b;
+        const Item* it;
+        bool logged = false;
+    };
+    for (size_t base = 0; base < items.size(); base += BATCH) {
+        size_t end = std::min(base + BATCH, items.size());
+        std::vector<Open> open;
+        uint64_t batch_max = 0;
+        for (size_t i = base; i < end; ++i) {
+            const Item& it = items[i];
+            Open o;
+            o.a = open_device(wait_for_device("/dev/zvol/" + it.a), O_RDONLY,
+                              "device to verify: " + it.a);
+            o.b = open_device(wait_for_device("/dev/zvol/" + it.b), O_RDONLY,
+                              "device to verify: " + it.b);
+            o.it = &it;
+            open.push_back(std::move(o));
+            batch_max = std::max(batch_max, std::max(it.sa, it.sb));
         }
-        done += std::max(it.sa, it.sb);
-        if (g_opts.verbose)
-            progress.message("[zvol-change-volblocksize] verified " + it.what + " (" +
-                             human(common) + " identical)");
+        for (uint64_t pos = 0; pos < batch_max; pos += CHUNK) {
+            for (Open& o : open) {
+                uint64_t sa = o.it->sa, sb = o.it->sb;
+                uint64_t isize = std::max(sa, sb), common = std::min(sa, sb);
+                if (pos >= isize) continue;
+                throw_if_interrupted();
+                size_t n = std::min<uint64_t>(CHUNK, isize - pos);
+                // Compare region: [pos, min(pos+n, common)) of both devices.
+                if (pos < common) {
+                    size_t cn = std::min<uint64_t>(n, common - pos);
+                    if (!sp::pread_full(o.a.get(), ba.data(), cn, pos) ||
+                        !sp::pread_full(o.b.get(), bb.data(), cn, pos))
+                        throw MigrateError("read error while verifying " + o.it->what +
+                                           " at offset " + std::to_string(pos));
+                    if (std::memcmp(ba.data(), bb.data(), cn) != 0)
+                        for (size_t k = 0; k < cn; ++k)
+                            if (ba[k] != bb[k])
+                                throw MigrateError(
+                                    "verification FAILED: " + o.it->what +
+                                    " differs from the original at offset " +
+                                    std::to_string(pos + k) + " (" + human(pos + k) + ")");
+                }
+                // Rounded-up tail: [max(pos,common), pos+n) of the bigger device (the dest
+                // rounded up to the new blocksize) must read as zeros.
+                if (pos + n > common) {
+                    uint64_t zs = std::max(pos, common);
+                    size_t zn = static_cast<size_t>(pos + n - zs);
+                    int big = sa > sb ? o.a.get() : o.b.get();
+                    if (!sp::pread_full(big, ba.data(), zn, zs))
+                        throw MigrateError("read error while verifying tail of " +
+                                           o.it->what + " at offset " + std::to_string(zs));
+                    if (std::memcmp(ba.data(), zeros.data(), zn) != 0)
+                        throw MigrateError("verification FAILED: rounded-up tail of " +
+                                           o.it->what + " is not all zeros");
+                }
+                done += n;
+                progress.update(done);
+                if (g_opts.verbose && pos + n >= isize && !o.logged) {
+                    o.logged = true;
+                    progress.message("[zvol-change-volblocksize] verified " + o.it->what +
+                                     " (" + human(common) + " identical)");
+                }
+            }
+        }
     }
     progress.finish(done);
     std::string what = mode == VerifyMode::All ? "all snapshots + head"
